@@ -576,25 +576,26 @@ async function refreshClassroom(): Promise<void> {
 }
 
 async function connectLesson(): Promise<void> {
-  if (!selectedLessonId.value) return;
+  const lessonId = selectedLessonId.value;
+  const environment = props.environment;
+  if (!lessonId) return;
   await run('connect', async () => {
-    await window.yuketang.connectLesson(
-      props.environment,
-      selectedLessonId.value,
-    );
-    connectedLessonIds.add(selectedLessonId.value);
-    collectingLessonId.value = selectedLessonId.value;
+    await window.yuketang.connectLesson(environment, lessonId);
+    connectedLessonIds.add(lessonId);
+    collectingLessonId.value = lessonId;
     infoMessage.value = '已打开官方课堂，正在收集题目与课件';
     await loadLessonData();
   });
 }
 
 async function loadLessonData(): Promise<void> {
-  if (!selectedLessonId.value) return;
+  const lessonId = selectedLessonId.value;
+  if (!lessonId) return;
   const [nextProblems, nextPresentations] = await Promise.all([
-    window.yuketang.listProblems(selectedLessonId.value),
-    window.yuketang.listPresentations(selectedLessonId.value),
+    window.yuketang.listProblems(lessonId),
+    window.yuketang.listPresentations(lessonId),
   ]);
+  if (selectedLessonId.value !== lessonId) return;
   problems.value = nextProblems;
   presentations.value = nextPresentations;
   if (!nextProblems.some((problem) => problem.id === selectedProblemId.value)) {
@@ -886,6 +887,7 @@ async function requestAiProposal(
   prompt: string,
   auto: boolean,
   retry: boolean,
+  automaticImageUrls?: readonly string[],
 ): Promise<void> {
   clearMessages();
   let session = aiChatSessions.get(contextId);
@@ -894,8 +896,10 @@ async function requestAiProposal(
       id: crypto.randomUUID(),
       contextId,
       ...(problem ? { problemId: problem.id } : {}),
-      imageUrls: [...selectedAiImages.value],
-      captureCurrentPage: captureCurrentBrowserPage.value,
+      imageUrls: auto
+        ? [...(automaticImageUrls ?? [])]
+        : [...selectedAiImages.value],
+      captureCurrentPage: !auto && captureCurrentBrowserPage.value,
       messages: [],
       requestVersion: 0,
       lastPrompt: prompt,
@@ -929,7 +933,7 @@ async function requestAiProposal(
     status: 'pending',
   });
   const pendingMessage = session.messages[session.messages.length - 1]!;
-  aiProposal.value = undefined;
+  if (currentAiContextId.value === contextId) aiProposal.value = undefined;
 
   if (auto && problem) {
     void emitLocalNotice(
@@ -943,11 +947,13 @@ async function requestAiProposal(
   try {
     const includeInitialContext =
       Boolean(problem) || retry || session.messages.length === 2;
-    const imageUrls = problem
-      ? [...selectedAiImages.value]
-      : includeInitialContext
-        ? [...session.imageUrls]
-        : [];
+    const imageUrls = auto
+      ? [...(automaticImageUrls ?? session.imageUrls)]
+      : problem
+        ? [...selectedAiImages.value]
+        : includeInitialContext
+          ? [...session.imageUrls]
+          : [];
     proposal = await window.yuketang.generateAnswerProposal({
       ...(session.problemId
         ? { problemId: session.problemId }
@@ -955,7 +961,7 @@ async function requestAiProposal(
       imageUrls,
       ...(imageUrls.length ? { imageSource: 'slide' as const } : {}),
       captureCurrentPage:
-        !problem && includeInitialContext && session.captureCurrentPage,
+        !auto && !problem && includeInitialContext && session.captureCurrentPage,
       customPrompt: prompt,
       sessionId: session.id,
       retry,
@@ -1042,13 +1048,16 @@ async function applyAutomaticProposal(
   if (selectedProblemId.value === problem.id) appliedProposalId.value = '';
   submissionMessage.value = `Agent 已于 ${formatTime(result.submittedAt)} 自动提交`;
   infoMessage.value = 'Agent 已自动确认并提交答案';
-  await loadLessonData();
   await emitLocalNotice(
     'auto-answer-succeeded',
     problem,
     'Agent 已提交答案',
     `${problemTypeLabel(problem.type)}已由模型完成并提交。`,
   );
+  if (selectedLessonId.value === problem.lessonId) {
+    // A display refresh failure must not turn a successful submission into a failure.
+    await loadLessonData().catch(() => {});
+  }
 }
 
 function proposalResponseText(proposal: AnswerProposal): string {
@@ -1158,10 +1167,7 @@ async function saveSettings(): Promise<void> {
     for (const timer of scheduledProblems.values()) clearTimeout(timer);
     scheduledProblems.clear();
   } else if (!wasAutoGenerateEnabled) {
-    for (const problem of problems.value) {
-      if (problem.status === 'available')
-        seenAvailableProblems.delete(problem.id);
-    }
+    seenAvailableProblems.clear();
     void automationTick();
   }
 }
@@ -1494,22 +1500,25 @@ async function automationTick(): Promise<void> {
         selectedLessonId.value = enteredLessonIds[0];
       }
     }
-    if (
-      !selectedLessonId.value ||
-      !connectedLessonIds.has(selectedLessonId.value)
-    )
-      return;
-    await loadLessonData();
-    const nextProblems = problems.value;
-    for (const problem of nextProblems) {
-      if (
-        problem.status !== 'available' ||
-        seenAvailableProblems.has(problem.id) ||
-        !currentSettings.llmAutoGenerate
-      )
-        continue;
-      seenAvailableProblems.add(problem.id);
-      await onAvailableProblem(problem);
+    for (const lessonId of connectedLessonIds) {
+      try {
+        const nextProblems = await window.yuketang.listProblems(lessonId);
+        for (const problem of nextProblems) {
+          if (
+            problem.status !== 'available' ||
+            seenAvailableProblems.has(problem.id) ||
+            !currentSettings.llmAutoGenerate
+          )
+            continue;
+          seenAvailableProblems.add(problem.id);
+          await onAvailableProblem(problem);
+        }
+      } catch {
+        // One unavailable lesson must not block the other connected lessons.
+      }
+    }
+    if (connectedLessonIds.has(selectedLessonId.value)) {
+      await loadLessonData();
     }
   } catch {
     // Background polling is reflected by the next explicit refresh or diagnostic log.
@@ -1538,18 +1547,45 @@ async function onAvailableProblem(problem: ProblemContext): Promise<void> {
   );
   const timer = setTimeout(() => {
     scheduledProblems.delete(problem.id);
-    const current = problems.value.find((item) => item.id === problem.id);
+    void answerScheduledProblem(problem);
+  }, delay);
+  scheduledProblems.set(problem.id, timer);
+}
+
+async function answerScheduledProblem(problem: ProblemContext): Promise<void> {
+  try {
+    if (!settings.value?.llmAutoGenerate) return;
+    const latest = await window.yuketang.listProblems(problem.lessonId);
+    const current = latest.find((item) => item.id === problem.id);
     if (
       !settings.value?.llmAutoGenerate ||
       current?.status !== 'available' ||
       (current.deadlineAt && current.deadlineAt <= Date.now())
     )
       return;
-    selectedProblemId.value = current.id;
-    aiSlideSelection.value = [];
-    void nextTick(() => analyzeProblem(true));
-  }, delay);
-  scheduledProblems.set(problem.id, timer);
+    const lessonPresentations = await window.yuketang.listPresentations(
+      current.lessonId,
+    );
+    const imageUrl = lessonPresentations
+      .find((presentation) => presentation.id === current.presentationId)
+      ?.slides.find((slide) => slide.id === current.slideId)?.imageUrl;
+    if (!settings.value?.llmAutoGenerate) return;
+    await requestAiProposal(
+      current,
+      current.id,
+      '分析这道题并给出答案建议。',
+      true,
+      false,
+      imageUrl ? [imageUrl] : [],
+    );
+  } catch (error) {
+    await emitLocalNotice(
+      'auto-answer-failed',
+      problem,
+      'Agent 未完成自动作答',
+      errorText(error),
+    );
+  }
 }
 
 async function refreshLogs(): Promise<void> {
