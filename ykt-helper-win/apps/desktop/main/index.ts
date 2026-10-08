@@ -1,4 +1,5 @@
 import { AssignmentAssets } from './assignment-assets.js';
+import { recordAutomationLog } from './automation-log.js';
 import { openAssignmentAnswerWindow } from './assignment-answer-window.js';
 import { existsSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
@@ -254,6 +255,10 @@ function registerIpc(): void {
       throw new Error('Invalid log limit.');
     }
     return getRuntime().facade.listLogs(limit);
+  });
+  ipcMain.handle(IpcChannel.LogAutomation, async (event, input: unknown) => {
+    assertTrustedIpc(event.sender, event.senderFrame?.url ?? '');
+    await recordAutomationLog(getRuntime().dataStore, input);
   });
   ipcMain.handle(
     IpcChannel.RefreshLessons,

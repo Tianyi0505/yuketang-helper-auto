@@ -1,4 +1,5 @@
 import type { AssignmentDetail, AssignmentAsset } from './assignment-detail.js';
+import type { AutomationLogInput } from './automation.js';
 import type {
   WebProbeReport,
   WebProbeEvidence,
@@ -58,6 +59,7 @@ export const IpcChannel = {
   GetUser: 'storage:get-user',
   RefreshUser: 'storage:refresh-user',
   ListLogs: 'storage:list-logs',
+  LogAutomation: 'automation:log',
   RefreshLessons: 'backend:refresh-lessons',
   ListLessons: 'backend:list-lessons',
   ListAssignments: 'backend:list-assignments',
@@ -132,6 +134,7 @@ export interface DesktopApi {
   getUser(environment: BrowserEnvironment): Promise<UserProfile | null>;
   refreshUser(environment: BrowserEnvironment): Promise<UserProfile>;
   listLogs(limit?: number): Promise<readonly AppLogEntry[]>;
+  logAutomation(input: AutomationLogInput): Promise<void>;
   refreshLessons(environment: BrowserEnvironment): Promise<readonly Lesson[]>;
   listLessons(): Promise<readonly Lesson[]>;
   /** Reuse this app session's collection unless an explicit refresh is requested. */

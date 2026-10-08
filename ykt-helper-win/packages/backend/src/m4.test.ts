@@ -212,7 +212,7 @@ describe('M4 backend active client', () => {
     expect(socket.closed).toBe(true);
   });
 
-  it('retries submit after re-check-in when the server returns 50004', async () => {
+  it('retries submit once after re-check-in when the server returns HTTP 401', async () => {
     const credentialsSource = new DynamicCredentialsSource(
       'initial-token',
       'session=abc',
@@ -253,7 +253,7 @@ describe('M4 backend active client', () => {
           ],
         },
       }),
-      response({ code: 50004 }),
+      { ...response({ msg: 'Unauthorized' }), status: 401 },
       response(
         { data: { lessonToken: 'fresh-token' } },
         { 'Set-Auth': 'refreshed-token' },
@@ -292,7 +292,7 @@ describe('M4 backend active client', () => {
     });
     expect(result).toMatchObject({ problemId: '11', status: 'submitted' });
     expect(transport.requests).toHaveLength(6);
-    // First submit attempt (failed with 50004)
+    // First submit attempt is explicitly rejected as unauthenticated.
     expect(transport.requests[3]).toMatchObject({
       method: 'POST',
       url: 'https://www.yuketang.cn/api/v3/lesson/problem/answer',
@@ -355,8 +355,8 @@ describe('M4 backend active client', () => {
           ],
         },
       }),
-      // First submit fails with 50004 (token expired)
-      response({ code: 50004 }),
+      // Only HTTP 401, not the lesson-ended code 50004, triggers refresh.
+      { ...response({ msg: 'Unauthorized' }), status: 401 },
       // Re-checkin returns fresh token
       response(
         { data: { lessonToken: 'fresh-token' } },

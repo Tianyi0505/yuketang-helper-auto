@@ -7,6 +7,7 @@ export * from './ipc.js';
 export * from './network.js';
 export * from './storage.js';
 export * from './assistant.js';
+export * from './automation.js';
 export * from './cli.js';
 export * from './settings-patch.js';
 export * from './assignments.js';

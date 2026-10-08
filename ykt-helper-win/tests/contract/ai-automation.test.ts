@@ -10,6 +10,7 @@ import {
   type Lesson,
   type Presentation,
   type ProblemContext,
+  type AutomationLogInput,
 } from '@ykt/contracts';
 import { createBackendRuntime, type AiProviderPlugin } from '@ykt/backend';
 import {
@@ -18,6 +19,10 @@ import {
   type ActiveHttpRequest,
 } from '@ykt/routing';
 import AssistantPanel from '../../apps/desktop/renderer/src/components/AssistantPanel.vue';
+import { recordAutomationLog } from '../../apps/desktop/main/automation-log.js';
+import { ElectronSessionCredentialSource } from '../../apps/desktop/main/electron-session-credentials.js';
+import { MemorySecretStore } from '@ykt/storage';
+import type { WebContents } from 'electron';
 
 vi.mock('vue', async (importOriginal) => ({
   ...(await importOriginal<typeof Vue>()),
@@ -115,174 +120,340 @@ describe('LLM automation settings', () => {
     expect(panel.selectedProblemId.value).toBe(problem.id);
   });
 
-  it('routes publications from two browser lessons through the backend to separate submissions', async () => {
-    const { panel } = setupPanel({
-      autoJoinEnabled: true,
-      llmAutoGenerate: true,
-      llmManagedSubmit: true,
-    });
-    const collector = new BrowserLessonCollector();
-    const submissions: ActiveHttpRequest[] = [];
-    const remoteLessons = [
-      { lessonId: 7, presentationId: 9, title: 'First', status: 1 },
-      { lessonId: 17, presentationId: 19, title: 'Second', status: 1 },
-    ];
-    const client = new YuketangActiveClient({
-      credentials: {
-        load: async () => ({
-          cookieHeader: '',
-          bearerToken: 'fixture',
-          userId: '42',
-        }),
-      },
-      browserCollector: collector,
-      socketFactory: () => {
-        throw new Error('Browser collection must use official page sockets');
-      },
-      transport: {
-        async request(request) {
-          if (request.url.endsWith('/classroom/on-lesson')) {
-            return {
-              status: 200,
-              headers: {},
-              body: { data: { onLessonClassrooms: remoteLessons } },
-            };
-          }
-          if (request.url.endsWith('/problem/answer')) {
-            submissions.push(request);
-            return { status: 200, headers: {}, body: { code: 0 } };
-          }
-          throw new Error(`Unexpected request: ${request.url}`);
-        },
-      },
-    });
-    const provider: AiProviderPlugin = {
-      id: 'fixture',
-      discoverModels: async () => [
-        {
-          id: 'fixture-model',
-          name: 'Fixture',
-          ownedBy: 'fixture',
-          created: null,
-          inputModalities: ['text'],
-          outputModalities: ['text'],
-          supportedParameters: [],
-          contextWindow: 32000,
-          outputLimit: 2000,
-        },
-      ],
-      complete: async () =>
-        JSON.stringify({
-          answer: 'A',
-          explanation: 'Fixture answer',
-          confidence: 0.9,
-          failureReason: null,
-        }),
-    };
-    const runtime = createBackendRuntime({
-      activeClient: client,
-      aiProviders: [provider],
-    });
-    await runtime.start();
-    try {
-      const facade = runtime.facade;
-      await facade.connectAiProfile({
-        providerId: provider.id,
-        baseUrl: 'https://fixture.example/v1',
-        apiKey: 'fixture-key',
+  it.each([
+    'success',
+    'submit-http-error',
+    'refresh-http-error',
+    'transport-error',
+    'lesson-ended',
+    'browser-rotated-auth',
+  ])(
+    'traces browser publications through automatic submissions: %s',
+    async (scenario) => {
+      const { panel } = setupPanel({
+        autoJoinEnabled: true,
+        llmAutoGenerate: true,
+        llmManagedSubmit: true,
       });
-      panel.applySettings(
-        await facade.updateSettings({
-          autoJoinEnabled: true,
-          llmAutoGenerate: true,
-          llmManagedSubmit: true,
-          autoAnswerDelay: 1000,
-          autoAnswerRandomDelay: 0,
-          notifyProblems: false,
-        }),
-      );
-      // These are the same facade calls as the desktop IPC handlers. All external I/O is fake.
-      vi.stubGlobal('window', {
-        yuketang: {
-          refreshLessons: facade.refreshLessons.bind(facade),
-          listLessons: facade.listLessons.bind(facade),
-          connectLesson: facade.connectLesson.bind(facade),
-          listProblems: facade.listProblems.bind(facade),
-          listPresentations: facade.listPresentations.bind(facade),
-          generateAnswerProposal: facade.generateAnswerProposal.bind(facade),
-          validateAnswer: facade.validateAnswer.bind(facade),
-          submitAnswer: facade.submitAnswer.bind(facade),
-        },
-      });
-      panel.selectedLessonId.value = '7';
-      await panel.automationTick();
-      expect([...panel.connectedLessonIds]).toEqual(['7', '17']);
-
-      for (const lesson of remoteLessons) {
-        const problemId = lesson.presentationId + 2;
-        const slideId = lesson.presentationId + 1;
-        await collector.observeWebSocket({
-          requestId: `socket-${lesson.lessonId}`,
-          direction: 'sent',
-          payload: JSON.stringify({ op: 'hello', lessonid: lesson.lessonId }),
-        });
-        await collector.observeHttp({
-          url: `https://www.yuketang.cn/api/v3/lesson/presentation/fetch?presentation_id=${lesson.presentationId}`,
-          statusCode: 200,
-          body: JSON.stringify({
-            data: {
-              id: lesson.presentationId,
-              title: lesson.title,
-              slides: [
-                {
-                  id: slideId,
-                  problem: {
-                    problemId,
-                    problemType: 1,
-                    content: lesson.title,
-                    options: ['One', 'Two'],
-                  },
+      const collector = new BrowserLessonCollector();
+      const submissions: ActiveHttpRequest[] = [];
+      const checkins: ActiveHttpRequest[] = [];
+      let pageAuthorization = 'fixture';
+      const expectedSuccess =
+        scenario === 'success' || scenario === 'browser-rotated-auth';
+      const remoteLessons = [
+        { lessonId: 7, presentationId: 9, title: 'First', status: 1 },
+        { lessonId: 17, presentationId: 19, title: 'Second', status: 1 },
+      ];
+      const client = new YuketangActiveClient({
+        credentials: new ElectronSessionCredentialSource(
+          () =>
+            ({
+              getURL: () =>
+                'https://www.yuketang.cn/lesson/fullscreen/v3/7/ppt/1',
+              executeJavaScript: async () => pageAuthorization,
+              session: {
+                cookies: {
+                  get: async () => [{ name: 'user_id', value: '42' }],
                 },
-              ],
-            },
+              },
+            }) as unknown as WebContents,
+          new MemorySecretStore(),
+        ),
+        browserCollector: collector,
+        socketFactory: () => {
+          throw new Error('Browser collection must use official page sockets');
+        },
+        transport: {
+          async request(request) {
+            if (request.url.endsWith('/classroom/on-lesson')) {
+              return {
+                status: 200,
+                headers: {},
+                body: { data: { onLessonClassrooms: remoteLessons } },
+              };
+            }
+            if (request.url.endsWith('/problem/answer')) {
+              submissions.push(request);
+              if (
+                scenario === 'browser-rotated-auth' &&
+                request.headers.authorization !==
+                  'Bearer rotated-by-official-page'
+              ) {
+                return {
+                  status: 401,
+                  headers: {},
+                  body: { msg: 'Stale authorization' },
+                };
+              }
+              if (scenario === 'lesson-ended')
+                return {
+                  status: 200,
+                  headers: {},
+                  body: { code: 50004, msg: '已经下课了。' },
+                };
+              if (scenario === 'transport-error')
+                throw new Error('Connection reset');
+              if (scenario === 'submit-http-error')
+                return {
+                  status: 400,
+                  headers: {},
+                  body: { code: 40001, msg: 'Invalid submission' },
+                };
+              if (scenario === 'refresh-http-error')
+                return {
+                  status: 401,
+                  headers: {},
+                  body: { msg: 'Expired credential' },
+                };
+              return { status: 200, headers: {}, body: { code: 0 } };
+            }
+            if (request.url.endsWith('/lesson/checkin')) {
+              checkins.push(request);
+              return {
+                status: 400,
+                headers: {},
+                body: {
+                  code: 40002,
+                  msg: 'Checkin rejected; token=secret-value',
+                },
+              };
+            }
+            throw new Error(`Unexpected request: ${request.url}`);
+          },
+        },
+      });
+      const provider: AiProviderPlugin = {
+        id: 'fixture',
+        discoverModels: async () => [
+          {
+            id: 'fixture-model',
+            name: 'Fixture',
+            ownedBy: 'fixture',
+            created: null,
+            inputModalities: ['text'],
+            outputModalities: ['text'],
+            supportedParameters: [],
+            contextWindow: 32000,
+            outputLimit: 2000,
+          },
+        ],
+        complete: async () =>
+          JSON.stringify({
+            answer: 'A',
+            explanation: 'Fixture answer',
+            confidence: 0.9,
+            failureReason: null,
           }),
+      };
+      const runtime = createBackendRuntime({
+        activeClient: client,
+        aiProviders: [provider],
+      });
+      await runtime.start();
+      try {
+        const facade = runtime.facade;
+        await facade.connectAiProfile({
+          providerId: provider.id,
+          baseUrl: 'https://fixture.example/v1',
+          apiKey: 'fixture-key',
         });
-        await collector.observeWebSocket({
-          requestId: `socket-${lesson.lessonId}`,
-          direction: 'received',
-          payload: JSON.stringify({
-            op: 'unlockproblem',
-            problem: {
-              problemId,
-              pres: lesson.presentationId,
-              slideId,
-              dt: Date.now(),
-              limit: 60,
-            },
+        panel.applySettings(
+          await facade.updateSettings({
+            autoJoinEnabled: true,
+            llmAutoGenerate: true,
+            llmManagedSubmit: true,
+            autoAnswerDelay: 1000,
+            autoAnswerRandomDelay: 0,
+            notifyProblems: false,
           }),
+        );
+        // These are the same facade calls as the desktop IPC handlers. All external I/O is fake.
+        vi.stubGlobal('window', {
+          yuketang: {
+            refreshLessons: facade.refreshLessons.bind(facade),
+            listLessons: facade.listLessons.bind(facade),
+            connectLesson: facade.connectLesson.bind(facade),
+            listProblems: facade.listProblems.bind(facade),
+            listPresentations: facade.listPresentations.bind(facade),
+            generateAnswerProposal: facade.generateAnswerProposal.bind(facade),
+            validateAnswer: facade.validateAnswer.bind(facade),
+            submitAnswer: facade.submitAnswer.bind(facade),
+            logAutomation: (input: AutomationLogInput) =>
+              recordAutomationLog(runtime.dataStore, input),
+          },
         });
-      }
-      await panel.automationTick();
-      await vi.advanceTimersByTimeAsync(1000);
+        panel.selectedLessonId.value = '7';
+        await panel.automationTick();
+        expect([...panel.connectedLessonIds]).toEqual(['7', '17']);
+        // Official classroom responses write a new Authorization to localStorage
+        // after the initial on-lesson request populated the backend cache.
+        if (scenario === 'browser-rotated-auth')
+          pageAuthorization = 'rotated-by-official-page';
 
-      expect(
-        submissions
-          .map((request) => JSON.parse(request.body!).problemId)
-          .sort(),
-      ).toEqual(['11', '21']);
-      expect(await facade.getProblem('11')).toMatchObject({
-        lessonId: '7',
-        status: 'answered',
-      });
-      expect(await facade.getProblem('21')).toMatchObject({
-        lessonId: '17',
-        status: 'answered',
-      });
-      expect(panel.selectedLessonId.value).toBe('7');
-    } finally {
-      await runtime.stop();
-    }
-  });
+        for (const lesson of remoteLessons) {
+          const problemId = lesson.presentationId + 2;
+          const slideId = lesson.presentationId + 1;
+          await collector.observeWebSocket({
+            requestId: `socket-${lesson.lessonId}`,
+            direction: 'sent',
+            payload: JSON.stringify({ op: 'hello', lessonid: lesson.lessonId }),
+          });
+          await collector.observeHttp({
+            url: `https://www.yuketang.cn/api/v3/lesson/presentation/fetch?presentation_id=${lesson.presentationId}`,
+            statusCode: 200,
+            body: JSON.stringify({
+              data: {
+                id: lesson.presentationId,
+                title: lesson.title,
+                slides: [
+                  {
+                    id: slideId,
+                    problem: {
+                      problemId,
+                      problemType: 1,
+                      content: lesson.title,
+                      options: ['One', 'Two'],
+                    },
+                  },
+                ],
+              },
+            }),
+          });
+          await collector.observeWebSocket({
+            requestId: `socket-${lesson.lessonId}`,
+            direction: 'received',
+            payload: JSON.stringify({
+              op: 'unlockproblem',
+              problem: {
+                problemId,
+                pres: lesson.presentationId,
+                slideId,
+                dt: Date.now(),
+                limit: 60,
+              },
+            }),
+          });
+        }
+        await panel.automationTick();
+        await vi.advanceTimersByTimeAsync(1000);
+
+        expect(
+          submissions
+            .map((request) => JSON.parse(request.body!).problemId)
+            .sort(),
+        ).toEqual(['11', '21']);
+        const logs = await facade.listLogs(200);
+        for (const problemId of ['11', '21']) {
+          const workflow = logs
+            .filter(
+              (log) =>
+                log.scope === 'automation' &&
+                (log.details as Record<string, unknown>)?.problemId ===
+                  problemId,
+            )
+            .reverse();
+          expect(
+            workflow.map(
+              (log) => (log.details as Record<string, unknown>).stage,
+            ),
+          ).toEqual([
+            'scheduled',
+            'started',
+            'generated',
+            'submit-started',
+            expectedSuccess ? 'submitted' : 'failed',
+          ]);
+        }
+        if (!expectedSuccess) {
+          const requestFailures = logs.filter(
+            (log) =>
+              log.scope === 'answer-request' &&
+              (log.details as Record<string, unknown>)?.stage ===
+                'submit-failed',
+          );
+          expect(requestFailures).toHaveLength(2);
+          expect(requestFailures[0]?.details).toMatchObject({
+            endpoint: 'https://www.yuketang.cn/api/v3/lesson/problem/answer',
+            method: 'POST',
+            confirmedBy: 'agent',
+            route: 'answer',
+            attempt: 1,
+            httpStatus:
+              scenario === 'transport-error'
+                ? null
+                : scenario === 'submit-http-error'
+                  ? 400
+                  : scenario === 'refresh-http-error'
+                    ? 401
+                    : 200,
+            remainingMs: 59000,
+            willRefresh: scenario === 'refresh-http-error',
+          });
+          if (scenario === 'refresh-http-error') {
+            expect(checkins).toHaveLength(2);
+            expect(JSON.parse(checkins[0]!.body!)).toMatchObject({ source: 1 });
+            expect(logs).toEqual(
+              expect.arrayContaining([
+                expect.objectContaining({
+                  scope: 'answer-request',
+                  details: expect.objectContaining({
+                    stage: 'credential-refresh-failed',
+                    endpoint: 'https://www.yuketang.cn/api/v3/lesson/checkin',
+                    httpStatus: 400,
+                    businessCode: 40002,
+                    serverMessage: 'Checkin rejected; token=[REDACTED]',
+                  }),
+                }),
+              ]),
+            );
+          }
+          if (scenario === 'lesson-ended') {
+            expect(checkins).toHaveLength(0);
+            expect(requestFailures[0]?.details).toMatchObject({
+              businessCode: 50004,
+              serverMessage: '已经下课了。',
+            });
+            const finalFailure = logs.find(
+              (log) => log.scope === 'answer' && log.level === 'error',
+            );
+            expect(
+              (finalFailure?.details as Record<string, unknown>).error,
+            ).toContain('课堂已结束');
+            expect(
+              (finalFailure?.details as Record<string, unknown>).error,
+            ).not.toContain('HTTP 400');
+          }
+          expect(JSON.stringify(logs)).not.toContain('secret-value');
+          expect(await facade.getProblem('11')).toMatchObject({
+            status: 'available',
+            result: null,
+          });
+          await panel.automationTick();
+          await vi.advanceTimersByTimeAsync(60000);
+          await panel.automationTick();
+          expect(submissions).toHaveLength(2);
+          expect(await facade.getProblem('11')).toMatchObject({
+            status: 'expired',
+            result: null,
+          });
+          return;
+        }
+        expect(await facade.getProblem('11')).toMatchObject({
+          lessonId: '7',
+          status: 'answered',
+        });
+        expect(await facade.getProblem('21')).toMatchObject({
+          lessonId: '17',
+          status: 'answered',
+        });
+        expect(panel.selectedLessonId.value).toBe('7');
+        expect(checkins).toHaveLength(0);
+      } finally {
+        await runtime.stop();
+      }
+    },
+  );
 
   it('keeps a scheduled answer bound to its lesson when the user switches lessons', async () => {
     const { panel, api, problem } = setupPanel({
@@ -320,6 +491,43 @@ describe('LLM automation settings', () => {
 
     expect(api.generateAnswerProposal).not.toHaveBeenCalled();
     expect(api.submitAnswer).not.toHaveBeenCalled();
+    expect(api.logAutomation).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        stage: 'skipped',
+        reason: 'problem-answered',
+        problemId: problem.id,
+      }),
+    );
+  });
+
+  it('logs insufficient time once even with notifications disabled', async () => {
+    const { panel, api, problem } = setupPanel({ llmAutoGenerate: true });
+    problem.deadlineAt = Date.now() + 500;
+    panel.connectedLessonIds.add(problem.lessonId);
+    await panel.automationTick();
+    await panel.automationTick();
+    await vi.runAllTimersAsync();
+    expect(api.logAutomation).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        stage: 'skipped',
+        reason: 'insufficient-time-before-deadline',
+        remainingMs: 500,
+        delayMs: 1000,
+      }),
+    );
+    expect(api.generateAnswerProposal).not.toHaveBeenCalled();
+  });
+
+  it('keeps automatic submission working if diagnostic persistence fails', async () => {
+    const { panel, api, problem } = setupPanel({
+      llmAutoGenerate: true,
+      llmManagedSubmit: true,
+    });
+    api.logAutomation.mockRejectedValue(new Error('Disk full'));
+    panel.connectedLessonIds.add(problem.lessonId);
+    await panel.automationTick();
+    await vi.runAllTimersAsync();
+    expect(api.submitAnswer).toHaveBeenCalledOnce();
   });
 
   it('continues polling other lessons when one lesson cannot be read', async () => {
@@ -516,6 +724,7 @@ function setupPanel(settings: Record<string, boolean>) {
     createdAt: new Date().toISOString(),
   };
   const api = {
+    logAutomation: vi.fn(async (_input: AutomationLogInput) => {}),
     generateAnswerProposal: vi.fn(
       async ({ problemId }: { problemId: string }) => ({
         ...proposal,

@@ -22,6 +22,7 @@ import {
   type LessonSocketFactory,
 } from './lesson-websocket.js';
 import { SessionManager } from './session-manager.js';
+import { ActiveRequestError } from './request-error.js';
 import type {
   ActiveHttpRequest,
   ActiveHttpResponse,
@@ -193,6 +194,7 @@ export class YuketangActiveClient {
       headers: {},
       body: JSON.stringify({
         lessonId,
+        source: 1,
         ...(classroomId ? { classroomId } : {}),
       }),
     });
@@ -307,12 +309,18 @@ export class YuketangActiveClient {
     request: ActiveHttpRequest,
     lessonId?: string,
   ): Promise<ActiveHttpResponse> {
-    const response = await this.#transport.request({
-      ...request,
-      headers: await this.sessions.headers(environment, lessonId),
-    });
+    const headers = await this.sessions.headers(environment, lessonId);
+    let response: ActiveHttpResponse;
+    try {
+      response = await this.#transport.request({ ...request, headers });
+    } catch (error) {
+      throw new ActiveRequestError(
+        error instanceof Error ? error.message : 'Yuketang transport failed.',
+        request,
+      );
+    }
     await this.sessions.captureResponse(environment, response);
-    assertSuccess(response);
+    assertSuccess(response, request);
     return response;
   }
 
@@ -351,14 +359,25 @@ function retryProblemIds(payload: unknown): readonly string[] {
   });
 }
 
-function assertSuccess(response: ActiveHttpResponse): void {
+function assertSuccess(
+  response: ActiveHttpResponse,
+  request: ActiveHttpRequest,
+): void {
   if (response.status < 200 || response.status >= 300) {
-    throw new Error(`Yuketang request failed with HTTP ${response.status}.`);
+    throw new ActiveRequestError(
+      `Yuketang request failed with HTTP ${response.status}.`,
+      request,
+      response,
+    );
   }
   if (typeof response.body === 'object' && response.body !== null) {
     const code = (response.body as Record<string, unknown>).code;
     if (typeof code === 'number' && code !== 0) {
-      throw new Error(`Yuketang request failed with code ${code}.`);
+      throw new ActiveRequestError(
+        `Yuketang request failed with code ${code}.${code === 50004 ? ' 课堂已结束，无法提交答案。' : ''}`,
+        request,
+        response,
+      );
     }
   }
 }

@@ -15,6 +15,7 @@ interface LessonTokenState extends CheckinResult {
 
 export class SessionManager {
   readonly #credentials = new Map<BrowserEnvironment, BrowserCredentials>();
+  readonly #sourceTokens = new Map<BrowserEnvironment, string | null>();
   readonly #lessonTokens = new Map<string, LessonTokenState>();
 
   constructor(
@@ -50,9 +51,17 @@ export class SessionManager {
   ): Promise<Readonly<Record<string, string>>> {
     const loaded = await this.source.load(environment);
     const current = this.#credentials.get(environment);
+    // Official pages rotate Authorization independently of active requests.
+    // A changed source wins; an unchanged page must not undo a newer Set-Auth.
+    const sourceChanged =
+      loaded.bearerToken !== this.#sourceTokens.get(environment);
+    this.#sourceTokens.set(environment, loaded.bearerToken);
     const credentials = {
       cookieHeader: loaded.cookieHeader,
-      bearerToken: current?.bearerToken ?? loaded.bearerToken,
+      bearerToken:
+        sourceChanged && loaded.bearerToken
+          ? loaded.bearerToken
+          : (current?.bearerToken ?? loaded.bearerToken),
       userId: loaded.userId ?? current?.userId ?? null,
     };
     this.#credentials.set(environment, credentials);
@@ -136,6 +145,7 @@ export class SessionManager {
 
   clear(): void {
     this.#credentials.clear();
+    this.#sourceTokens.clear();
     this.#lessonTokens.clear();
   }
 }

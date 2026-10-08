@@ -14,6 +14,7 @@ import {
   type AnswerProposal,
   type AppLogEntry,
   type AppSettings,
+  type AutomationLogInput,
   type BrowserEnvironment,
   type ClassroomNotice,
   type ClassroomNoticeKind,
@@ -936,7 +937,7 @@ async function requestAiProposal(
   if (currentAiContextId.value === contextId) aiProposal.value = undefined;
 
   if (auto && problem) {
-    void emitLocalNotice(
+    await emitLocalNotice(
       'auto-answer-started',
       problem,
       'Agent 开始作答',
@@ -961,7 +962,10 @@ async function requestAiProposal(
       imageUrls,
       ...(imageUrls.length ? { imageSource: 'slide' as const } : {}),
       captureCurrentPage:
-        !auto && !problem && includeInitialContext && session.captureCurrentPage,
+        !auto &&
+        !problem &&
+        includeInitialContext &&
+        session.captureCurrentPage,
       customPrompt: prompt,
       sessionId: session.id,
       retry,
@@ -996,6 +1000,9 @@ async function requestAiProposal(
   }
 
   if (!problem) return;
+  if (proposal.status === 'ready') {
+    await logAutomation(problem, 'generated');
+  }
   if (agentAutoSubmitEnabled.value) {
     await applyAutomaticProposal(problem, proposal);
     return;
@@ -1036,9 +1043,11 @@ async function applyAutomaticProposal(
 
   if (!agentAutoSubmitEnabled.value) {
     infoMessage.value = 'LLM 已生成答案，托管提交已关闭。';
+    await logAutomation(problem, 'skipped', 'managed-submit-disabled');
     return;
   }
 
+  await logAutomation(problem, 'submit-started');
   const result = await window.yuketang.submitAnswer({
     problemId: problem.id,
     answer: proposal.answer,
@@ -1048,6 +1057,7 @@ async function applyAutomaticProposal(
   if (selectedProblemId.value === problem.id) appliedProposalId.value = '';
   submissionMessage.value = `Agent 已于 ${formatTime(result.submittedAt)} 自动提交`;
   infoMessage.value = 'Agent 已自动确认并提交答案';
+  await logAutomation(problem, 'submitted');
   await emitLocalNotice(
     'auto-answer-succeeded',
     problem,
@@ -1380,6 +1390,13 @@ async function emitLocalNotice(
   title: string,
   detail: string,
 ): Promise<void> {
+  if (kind === 'auto-answer-started' || kind === 'auto-answer-failed') {
+    await logAutomation(
+      problem,
+      kind === 'auto-answer-started' ? 'started' : 'failed',
+      kind === 'auto-answer-failed' ? detail : '',
+    );
+  }
   await handleClassroomNotice({
     kind,
     lessonId: problem.lessonId,
@@ -1388,6 +1405,29 @@ async function emitLocalNotice(
     detail,
     occurredAt: Date.now(),
   });
+}
+
+async function logAutomation(
+  problem: ProblemContext,
+  stage: AutomationLogInput['stage'],
+  reason = '',
+  delayMs: number | null = null,
+): Promise<void> {
+  try {
+    await window.yuketang.logAutomation({
+      stage,
+      lessonId: problem.lessonId,
+      problemId: problem.id,
+      deadlineAt: problem.deadlineAt,
+      remainingMs:
+        problem.deadlineAt === null ? null : problem.deadlineAt - Date.now(),
+      delayMs,
+      managedSubmit: agentAutoSubmitEnabled.value,
+      reason: reason.slice(0, 2048),
+    });
+  } catch {
+    // Logging failures must not interrupt automatic answers.
+  }
 }
 
 async function deliverNotice(notice: ClassroomNotice): Promise<void> {
@@ -1538,7 +1578,16 @@ async function onAvailableProblem(problem: ProblemContext): Promise<void> {
   const remaining = problem.deadlineAt
     ? problem.deadlineAt - Date.now()
     : Infinity;
-  if (remaining <= delay) return;
+  if (remaining <= delay) {
+    await logAutomation(
+      problem,
+      'skipped',
+      'insufficient-time-before-deadline',
+      delay,
+    );
+    return;
+  }
+  await logAutomation(problem, 'scheduled', '', delay);
   await emitLocalNotice(
     'auto-answer-scheduled',
     problem,
@@ -1554,22 +1603,40 @@ async function onAvailableProblem(problem: ProblemContext): Promise<void> {
 
 async function answerScheduledProblem(problem: ProblemContext): Promise<void> {
   try {
-    if (!settings.value?.llmAutoGenerate) return;
+    if (!settings.value?.llmAutoGenerate) {
+      await logAutomation(problem, 'skipped', 'auto-generation-disabled');
+      return;
+    }
     const latest = await window.yuketang.listProblems(problem.lessonId);
     const current = latest.find((item) => item.id === problem.id);
     if (
       !settings.value?.llmAutoGenerate ||
       current?.status !== 'available' ||
       (current.deadlineAt && current.deadlineAt <= Date.now())
-    )
+    ) {
+      await logAutomation(
+        current ?? problem,
+        'skipped',
+        !settings.value?.llmAutoGenerate
+          ? 'auto-generation-disabled'
+          : !current
+            ? 'problem-not-found'
+            : current.status !== 'available'
+              ? `problem-${current.status}`
+              : 'deadline-passed',
+      );
       return;
+    }
     const lessonPresentations = await window.yuketang.listPresentations(
       current.lessonId,
     );
     const imageUrl = lessonPresentations
       .find((presentation) => presentation.id === current.presentationId)
       ?.slides.find((slide) => slide.id === current.slideId)?.imageUrl;
-    if (!settings.value?.llmAutoGenerate) return;
+    if (!settings.value?.llmAutoGenerate) {
+      await logAutomation(current, 'skipped', 'auto-generation-disabled');
+      return;
+    }
     await requestAiProposal(
       current,
       current.id,

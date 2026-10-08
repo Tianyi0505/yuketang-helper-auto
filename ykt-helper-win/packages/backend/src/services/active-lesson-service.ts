@@ -12,9 +12,11 @@ import {
   type ProblemContext,
   type SubmissionResult,
   type UserProfile,
+  type JsonValue,
 } from '@ykt/contracts';
 import {
   normalizeTimestamp,
+  ActiveRequestError,
   type ActiveLesson,
   type BrowserArchivedPresentationObservation,
   type YuketangActiveClient,
@@ -27,16 +29,9 @@ import {
   systemClock,
   type Clock,
 } from '../workflows/lesson-state-machine.js';
-import {
-  AnswerService,
-  planSubmission,
-} from './answer-service.js';
+import { AnswerService, planSubmission } from './answer-service.js';
 import { ProblemService } from './problem-service.js';
-import {
-  getRealtimeEvent,
-  findEntity,
-  firstText,
-} from './classroom-events.js';
+import { getRealtimeEvent, findEntity, firstText } from './classroom-events.js';
 
 const simulationLessonId = 'local-classroom-simulator';
 const noticeDedupeWindow = 60_000;
@@ -190,7 +185,7 @@ export class ActiveLessonService {
       environment,
       problem,
       validation.normalizedAnswer,
-      input.forceRetry ?? false,
+      input,
     );
     this.repository
       .getSession(problem.lessonId)
@@ -207,7 +202,7 @@ export class ActiveLessonService {
     environment: BrowserEnvironment,
     problem: ProblemContext,
     answer: AnswerValue,
-    forceRetry: boolean,
+    input: AnswerInput,
     retried = false,
   ): Promise<'answer' | 'retry'> {
     const plan = planSubmission({
@@ -216,25 +211,72 @@ export class ActiveLessonService {
       now: this.clock.now(),
       startTime: problem.unlockedAt,
       endTime: problem.deadlineAt,
-      ...(forceRetry ? { forceRetry: true } : {}),
+      ...(input.forceRetry ? { forceRetry: true } : {}),
+    });
+    const startedAt = this.clock.now();
+    const context = {
+      environment,
+      lessonId: problem.lessonId,
+      problemId: problem.id,
+      proposalId: input.proposalId ?? null,
+      confirmedBy: input.confirmedBy ?? 'user',
+      route: plan.route,
+      attempt: retried ? 2 : 1,
+      deadlineAt: problem.deadlineAt,
+      remainingMs:
+        problem.deadlineAt === null ? null : problem.deadlineAt - startedAt,
+    };
+    await this.logSubmission('info', '开始提交答案请求。', {
+      ...context,
+      stage: 'submit-started',
     });
     try {
       await this.client.submit(environment, problem.lessonId, plan);
+      await this.logSubmission('info', '答案请求已被服务端接受。', {
+        ...context,
+        stage: 'submit-succeeded',
+        elapsedMs: this.clock.now() - startedAt,
+      });
       return plan.route;
     } catch (error) {
-      if (retried || !this.#isTokenExpiredError(error)) {
+      const willRefresh = !retried && this.#isTokenExpiredError(error);
+      await this.logSubmission('error', '答案请求失败。', {
+        ...context,
+        stage: 'submit-failed',
+        elapsedMs: this.clock.now() - startedAt,
+        willRefresh,
+        ...submissionErrorDetails(error),
+      });
+      if (!willRefresh) {
         throw error;
       }
-      const refreshed = await this.client.checkin(
-        environment,
-        problem.lessonId,
-        this.#remoteLessons.get(problem.lessonId)?.classroomId ?? undefined,
-      );
-      if (!refreshed.lessonToken) {
-        throw new YuketangError({
-          code: ErrorCode.NotAuthenticated,
-          message: 'Unable to refresh the lesson token.',
+      await this.logSubmission('info', '开始刷新课堂凭据。', {
+        ...context,
+        stage: 'credential-refresh-started',
+      });
+      try {
+        const refreshed = await this.client.checkin(
+          environment,
+          problem.lessonId,
+          this.#remoteLessons.get(problem.lessonId)?.classroomId ?? undefined,
+        );
+        if (!refreshed.lessonToken) {
+          throw new YuketangError({
+            code: ErrorCode.NotAuthenticated,
+            message: 'Unable to refresh the lesson token.',
+          });
+        }
+        await this.logSubmission('info', '课堂凭据已刷新，准备重试提交。', {
+          ...context,
+          stage: 'credential-refresh-succeeded',
         });
+      } catch (refreshError) {
+        await this.logSubmission('error', '课堂凭据刷新失败，未重试提交。', {
+          ...context,
+          stage: 'credential-refresh-failed',
+          ...submissionErrorDetails(refreshError),
+        });
+        throw refreshError;
       }
       // Recalculate the plan with the current time after re-checkin,
       // in case the deadline was crossed during the checkin round-trip.
@@ -242,17 +284,36 @@ export class ActiveLessonService {
         environment,
         problem,
         answer,
-        forceRetry,
+        input,
         true,
       );
     }
   }
 
-  #isTokenExpiredError(error: unknown): boolean {
-    if (error instanceof Error) {
-      return error.message.includes('code 50004');
+  private async logSubmission(
+    level: 'info' | 'error',
+    message: string,
+    details: Record<string, JsonValue>,
+  ): Promise<void> {
+    try {
+      await this.storage.appendLog({
+        level,
+        scope: 'answer-request',
+        message,
+        details,
+      });
+    } catch {
+      // Diagnostics must not prevent submission or change its result.
     }
-    return false;
+  }
+
+  #isTokenExpiredError(error: unknown): boolean {
+    // 50004 means "class is over", not expired credentials. Never mask it
+    // with a secondary checkin failure. Only explicit HTTP authentication
+    // rejection is eligible for the existing one-time refresh/retry.
+    return (
+      error instanceof ActiveRequestError && error.diagnostic.httpStatus === 401
+    );
   }
 
   getSimulation(): ClassroomSimulationState {
@@ -604,12 +665,7 @@ export class ActiveLessonService {
     if (machine.session.lesson.status === 'ended') return;
 
     const problemId =
-      firstText(message, [
-        'problemId',
-        'problem_id',
-        'problemid',
-        'id',
-      ]) ||
+      firstText(message, ['problemId', 'problem_id', 'problemid', 'id']) ||
       firstText(findEntity(message), [
         'problemId',
         'problem_id',
@@ -805,6 +861,13 @@ export class ActiveLessonService {
     this.#noticeTimes.set(notice.dedupeKey, notice.occurredAt);
     this.onNotice(notice);
   }
+}
+
+function submissionErrorDetails(error: unknown): Record<string, JsonValue> {
+  return {
+    error: error instanceof Error ? error.message : 'Unknown error',
+    ...(error instanceof ActiveRequestError ? error.diagnostic : {}),
+  };
 }
 
 function record(value: unknown): Record<string, unknown> | null {
