@@ -75,6 +75,7 @@ interface SettingsDraft {
   autoAnswerDelaySeconds: number;
   autoAnswerRandomDelaySeconds: number;
   keepScreenAwake: boolean;
+  autoRestartEnabled: boolean;
   aiAnalyzeLatestOnOpen: boolean;
   aiSlidePickPriority: boolean;
   aiCaptureCurrentPage: boolean;
@@ -1573,6 +1574,7 @@ async function saveSettings(): Promise<void> {
       autoAnswerRandomDelay:
         clamp(draft.autoAnswerRandomDelaySeconds, 0, 30) * 1000,
       keepScreenAwake: draft.keepScreenAwake,
+      autoRestartEnabled: draft.autoRestartEnabled,
       aiAnalyzeLatestOnOpen: draft.aiAnalyzeLatestOnOpen,
       aiSlidePickPriority: draft.aiSlidePickPriority,
       aiCaptureCurrentPage: draft.aiCaptureCurrentPage,
@@ -1622,6 +1624,7 @@ function applySettings(value: AppSettings): void {
       value.autoAnswerRandomDelay / 1000,
     ),
     keepScreenAwake: value.keepScreenAwake,
+    autoRestartEnabled: value.autoRestartEnabled,
     aiAnalyzeLatestOnOpen: value.aiAnalyzeLatestOnOpen,
     aiSlidePickPriority: value.aiSlidePickPriority,
     aiCaptureCurrentPage: value.aiCaptureCurrentPage,
@@ -3665,6 +3668,16 @@ function clamp(value: number, min: number, max: number): number {
                 </span>
                 <input
                   v-model="settingsDraft.keepScreenAwake"
+                  type="checkbox"
+                />
+              </label>
+              <label class="switch-row">
+                <span>
+                  <strong>异常退出后自动重启</strong>
+                  <small>默认关闭，保存后生效。正常关闭不重启。</small>
+                </span>
+                <input
+                  v-model="settingsDraft.autoRestartEnabled"
                   type="checkbox"
                 />
               </label>

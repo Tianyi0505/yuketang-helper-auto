@@ -1,5 +1,6 @@
 import { AssignmentAssets } from './assignment-assets.js';
 import { recordAutomationLog } from './automation-log.js';
+import { createAutoRestart, restoreRestartProfile } from './auto-restart.js';
 import { openAssignmentAnswerWindow } from './assignment-answer-window.js';
 import { existsSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
@@ -14,7 +15,6 @@ import {
   Notification,
   powerSaveBlocker,
   shell,
-  Tray,
   type WebContents,
 } from 'electron';
 import { createBackendRuntime, type BackendRuntime } from '@ykt/backend';
@@ -26,6 +26,7 @@ import {
   parseLessonPage,
   isWebAreaBounds,
   type AnswerInput,
+  type AppSettings,
   type ConnectAiProfileInput,
   type ClassroomSimulationAction,
   type GenerateAnswerProposalInput,
@@ -65,20 +66,19 @@ import { isSourceModuleId, sourceModulePath } from './source-modules.js';
 let assignmentAssets: AssignmentAssets | undefined;
 let assignmentAnswerPending = false;
 let runtime: BackendRuntime | undefined;
+let startupDataStore: SqliteAppDataStore | undefined;
 let mainWindow: BrowserWindow | undefined;
 let browserController: BrowserController | undefined;
 let networkLabController: NetworkLabController | undefined;
 let lessonCollector: BrowserLessonCollector | undefined;
 let webProbeController: WebProbeController | undefined;
 let cliServer: DesktopCliServer | undefined;
+type QuitPhase = 'running' | 'cleaning' | 'ready';
+let quitPhase: QuitPhase = 'running';
 let serviceCleanupPromise: Promise<void> | undefined;
-let quitAfterCleanup = false;
 let keepScreenAwake = false;
 let wakeLockId: number | null = null;
 const activeNotifications = new Set<Notification>();
-let tray: Tray | undefined;
-/** 真正的退出流程已开始（托盘菜单退出 / 系统关机 / 更新重启），此时关闭窗口不再隐藏。 */
-let isQuitting = false;
 
 function recordNotificationLog(entry: Omit<NewAppLogEntry, 'scope'>): void {
   // Never let diagnostic storage interrupt a classroom event or OS request.
@@ -95,6 +95,18 @@ configureStorageProfile();
 
 const hasSingleInstanceLock =
   !electronSquirrelStartup && app.requestSingleInstanceLock();
+const autoRestart = hasSingleInstanceLock
+  ? createAutoRestart(app, __dirname, (error) => {
+      console.error('[ykt-helper] 自动重启已失效：', error);
+      if (quitPhase !== 'running') return;
+      const settingsStore = runtime?.facade ?? startupDataStore;
+      void settingsStore
+        ?.updateSettings({ autoRestartEnabled: false })
+        .catch(reportStartupError);
+    })
+  : undefined;
+let restartExitPromise: Promise<void> | undefined;
+let settingsUpdatePromise = Promise.resolve();
 if (!hasSingleInstanceLock) {
   console.warn(
     '[ykt-helper] 已有一个桌面实例在运行，本次启动将直接退出并激活现有窗口。' +
@@ -108,6 +120,7 @@ if (!hasSingleInstanceLock) {
 }
 
 function configureStorageProfile(): void {
+  if (restoreRestartProfile(app)) return;
   const portableMarker = join(dirname(app.getPath('exe')), 'portable.flag');
   if (process.argv.includes('--portable') || existsSync(portableMarker)) {
     app.setPath(
@@ -143,17 +156,13 @@ function registerIpc(): void {
     if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
       throw new Error('Invalid settings.');
     }
-    const settings = await getRuntime().facade.updateSettings(patch);
-    keepScreenAwake = settings.keepScreenAwake;
-    syncScreenWakeLock();
-    return settings;
+    return updateDesktopSettings(() =>
+      getRuntime().facade.updateSettings(patch),
+    );
   });
   ipcMain.handle(IpcChannel.ResetSettings, async (event) => {
     assertTrustedIpc(event.sender, event.senderFrame?.url ?? '');
-    const settings = await getRuntime().facade.resetSettings();
-    keepScreenAwake = settings.keepScreenAwake;
-    syncScreenWakeLock();
-    return settings;
+    return updateDesktopSettings(() => getRuntime().facade.resetSettings());
   });
   ipcMain.handle(IpcChannel.ListAiProfiles, async (event) => {
     assertTrustedIpc(event.sender, event.senderFrame?.url ?? '');
@@ -766,6 +775,62 @@ function registerIpc(): void {
   });
 }
 
+function updateDesktopSettings(
+  update: () => Promise<AppSettings>,
+): Promise<AppSettings> {
+  const result = settingsUpdatePromise.then(async () => {
+    const facade = getRuntime().facade;
+    const previous = await facade.getSettings();
+    const settings = await update();
+    keepScreenAwake = settings.keepScreenAwake;
+    syncScreenWakeLock();
+    try {
+      await autoRestart?.setEnabled(settings.autoRestartEnabled);
+    } catch (error) {
+      let restored = previous.autoRestartEnabled;
+      let recoveryError: unknown;
+      try {
+        await autoRestart?.setEnabled(restored);
+      } catch (failure) {
+        restored = false;
+        recoveryError = failure;
+        try {
+          await autoRestart?.setEnabled(false);
+        } catch (failure) {
+          recoveryError = failure;
+        }
+      }
+      await facade.updateSettings({ autoRestartEnabled: restored });
+      throw new Error(
+        `自动重启设置未生效，${
+          recoveryError
+            ? '未能恢复原状态，已保存关闭设置；辅助进程状态无法确认，请正常退出后重开。'
+            : '已恢复原状态。'
+        }其他设置已保存。${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    return settings;
+  });
+  settingsUpdatePromise = result.then(
+    () => {},
+    () => {},
+  );
+  return result;
+}
+
+function stopAutoRestartForExit(): Promise<void> {
+  restartExitPromise ??=
+    autoRestart?.prepareNormalExit().catch((error: unknown) => {
+      console.error(
+        '[ykt-helper] 自动重启辅助进程停止失败，继续正常退出：',
+        error,
+      );
+    }) ?? Promise.resolve();
+  return restartExitPromise;
+}
+
 function assertTrustedIpc(sender: WebContents, senderUrl: string): void {
   if (!isTrustedRenderer(sender, senderUrl)) {
     throw new Error('IPC request rejected.');
@@ -971,6 +1036,7 @@ function safeFileName(value: string): string {
 }
 
 async function showMainWindow(): Promise<void> {
+  if (quitPhase !== 'running' || serviceCleanupPromise) return;
   if (!mainWindow || mainWindow.isDestroyed()) {
     if (app.isReady()) await createWindow();
     return;
@@ -980,59 +1046,8 @@ async function showMainWindow(): Promise<void> {
   mainWindow.focus();
 }
 
-/** 开发态图标在 apps/desktop/build，打包态由 electron-forge 的 extraResource 放到 resources。 */
-function resolveTrayIconPath(): string | undefined {
-  return [
-    join(process.resourcesPath, 'icon.ico'),
-    join(__dirname, '../../build/icon.ico'),
-  ].find((candidate) => existsSync(candidate));
-}
-
-/**
- * 常驻托盘：关闭窗口只隐藏，进程、内嵌网页与自动化任务继续运行。
- * 托盘图标不可用时自动退回“关闭即退出”，避免出现无法关闭的窗口。
- */
-function createTray(): void {
-  if (tray) return;
-  const iconPath = resolveTrayIconPath();
-  if (!iconPath) {
-    console.warn('[ykt-helper] 未找到托盘图标，关闭窗口将直接退出应用。');
-    return;
-  }
-  try {
-    const nextTray = new Tray(iconPath);
-    nextTray.setToolTip('雨课堂助手');
-    nextTray.setContextMenu(
-      Menu.buildFromTemplate([
-        {
-          label: '显示主窗口',
-          click: () => void showMainWindow().catch(reportStartupError),
-        },
-        { type: 'separator' },
-        { label: '退出雨课堂助手', click: () => quitFromTray() },
-      ]),
-    );
-    nextTray.on('click', () => void showMainWindow().catch(reportStartupError));
-    tray = nextTray;
-    console.log('[ykt-helper] 托盘已就绪，关闭窗口将隐藏到托盘继续运行。');
-  } catch (error: unknown) {
-    console.warn(
-      '[ykt-helper] 托盘创建失败，关闭窗口将直接退出应用：',
-      error instanceof Error ? error.message : error,
-    );
-  }
-}
-
-function quitFromTray(): void {
-  isQuitting = true;
-  app.quit();
-}
-
 async function createWindow(): Promise<void> {
-  if (serviceCleanupPromise) {
-    await serviceCleanupPromise;
-    serviceCleanupPromise = undefined;
-  }
+  if (quitPhase !== 'running' || serviceCleanupPromise) return;
   const window = new BrowserWindow({
     show: false,
     width: 1180,
@@ -1047,8 +1062,7 @@ async function createWindow(): Promise<void> {
       sandbox: true,
       // Notification audio belongs to the trusted shell, not the embedded site.
       autoplayPolicy: 'no-user-gesture-required',
-      // 常驻托盘后窗口可能长期处于隐藏状态，禁止后台节流，
-      // 否则渲染进程里的定时轮询/答题流程会被浏览器降频甚至暂停。
+      // 最小化时渲染进程仍需运行课堂轮询与答题流程。
       backgroundThrottling: false,
     },
   });
@@ -1100,14 +1114,14 @@ async function createWindow(): Promise<void> {
   webProbeController = nextWebProbeController;
   const windowResources: { cliServer?: DesktopCliServer } = {};
   let disposed = false;
-  window.on('close', (event) => {
-    if (!isQuitting && tray) {
-      // 常驻：关闭窗口只收起，不销毁内嵌网页与运行时，自动化继续在后台运行。
-      event.preventDefault();
-      window.hide();
-      console.log('[ykt-helper] 窗口已隐藏到托盘，进程与自动化继续在后台运行。');
-      return;
-    }
+  window.on('query-session-end', () => {
+    void stopAutoRestartForExit();
+  });
+  window.on('session-end', () => {
+    void stopAutoRestartForExit();
+  });
+  window.on('close', () => {
+    void stopAutoRestartForExit();
     if (disposed) return;
     disposed = true;
     nextWebProbeController.cancel();
@@ -1130,15 +1144,29 @@ async function createWindow(): Promise<void> {
     }
     if (cliServer === windowResources.cliServer) cliServer = undefined;
     runtime = undefined;
+    startupDataStore = undefined;
   });
 
   const storageDirectory = join(app.getPath('userData'), 'storage');
   const dataStore = new SqliteAppDataStore(
     join(storageDirectory, 'yuketang.sqlite'),
   );
+  startupDataStore = dataStore;
   const settings = await dataStore.getSettings();
   keepScreenAwake = settings.keepScreenAwake;
   if (window.isDestroyed()) {
+    if (startupDataStore === dataStore) startupDataStore = undefined;
+    dataStore.close();
+    return;
+  }
+  try {
+    await autoRestart?.setEnabled(settings.autoRestartEnabled);
+  } catch (error) {
+    await dataStore.updateSettings({ autoRestartEnabled: false });
+    console.error('[ykt-helper] 自动重启启动失败，已关闭该设置：', error);
+  }
+  if (window.isDestroyed()) {
+    if (startupDataStore === dataStore) startupDataStore = undefined;
     dataStore.close();
     return;
   }
@@ -1148,6 +1176,7 @@ async function createWindow(): Promise<void> {
   });
   if (window.isDestroyed()) {
     resourceCache.close();
+    if (startupDataStore === dataStore) startupDataStore = undefined;
     dataStore.close();
     return;
   }
@@ -1219,7 +1248,10 @@ async function createWindow(): Promise<void> {
     },
   );
   runtime = nextRuntime;
+  startupDataStore = undefined;
   await nextRuntime.start();
+  if (window.isDestroyed() || quitPhase !== 'running' || serviceCleanupPromise)
+    return;
   windowResources.cliServer = new DesktopCliServer(
     createDesktopCliHandler({
       facade: nextRuntime.facade,
@@ -1280,14 +1312,7 @@ if (hasSingleInstanceLock) {
     .then(async () => {
       Menu.setApplicationMenu(null);
       registerIpc();
-      createTray();
       await createWindow();
-
-      app.on('activate', () => {
-        if (BrowserWindow.getAllWindows().length === 0) {
-          void createWindow().catch(reportStartupError);
-        }
-      });
     })
     .catch((error: unknown) => {
       reportStartupError(error);
@@ -1328,15 +1353,17 @@ function cleanupServices(): Promise<void> {
 }
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit();
+  app.quit();
 });
 
 app.on('before-quit', (event) => {
-  isQuitting = true;
-  if (quitAfterCleanup) return;
+  if (quitPhase === 'ready') return;
   event.preventDefault();
-  void cleanupServices().finally(() => {
-    quitAfterCleanup = true;
+  if (quitPhase === 'cleaning') return;
+  quitPhase = 'cleaning';
+  const restartStopped = stopAutoRestartForExit();
+  void Promise.allSettled([restartStopped, cleanupServices()]).then(() => {
+    quitPhase = 'ready';
     app.quit();
   });
 });

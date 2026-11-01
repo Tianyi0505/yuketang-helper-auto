@@ -11,6 +11,21 @@ describe('assertSettingsPatch', () => {
     ).not.toThrow();
   });
 
+  it.each([true, false])('接受自动重启开关 %j', (value) => {
+    expect(() =>
+      assertSettingsPatch({ autoRestartEnabled: value }),
+    ).not.toThrow();
+  });
+
+  it.each([null, undefined, 0, 1, 'true', 'false', [], {}])(
+    '拒绝非布尔自动重启开关 %j',
+    (value) => {
+      expect(catchError({ autoRestartEnabled: value })?.code).toBe(
+        ErrorCode.InvalidArgument,
+      );
+    },
+  );
+
   it.each(INVALID)('拒绝非普通对象或空补丁：%j', (value) => {
     // Object.create(null) 是普通对象但为空，同样应被拒绝。
     expect(() => assertSettingsPatch(value)).toThrowError(YuketangError);

@@ -9,8 +9,7 @@ async function cleanPackagedDirectory(outputPath) {
   await Promise.all(
     localeFiles
       .filter(
-        (entry) =>
-          entry.isFile() && !/^(?:en|zh)(?:-|\.)/i.test(entry.name),
+        (entry) => entry.isFile() && !/^(?:en|zh)(?:-|\.)/i.test(entry.name),
       )
       .map((entry) => rm(path.join(localesPath, entry.name))),
   );
@@ -28,10 +27,7 @@ module.exports = {
     },
     executableName: 'YuketangHelper',
     icon: path.join(__dirname, 'build', 'icon'),
-    extraResource: [
-      path.join(__dirname, 'cli', 'ykt-cli.cjs'),
-      path.join(__dirname, 'build', 'icon.ico'),
-    ],
+    extraResource: [path.join(__dirname, 'cli', 'ykt-cli.cjs')],
     ignore: [
       /^\/\.electron-cache($|\/)/,
       /^\/build($|\/)/,

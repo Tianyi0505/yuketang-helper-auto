@@ -24,6 +24,7 @@ const BOOLEAN_KEYS = [
   'llmAutoGenerate',
   'llmManagedSubmit',
   'keepScreenAwake',
+  'autoRestartEnabled',
   'aiAnalyzeLatestOnOpen',
   'aiSlidePickPriority',
   'aiCaptureCurrentPage',

@@ -1,7 +1,7 @@
+import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 
 import {
@@ -715,10 +715,9 @@ describe('CLI command parity', () => {
 });
 
 function testPipePath(): string {
-  const name = `yuketang-helper-cli-${process.pid}-${Date.now()}-${Math.random()}`;
-  return process.platform === 'win32'
-    ? `\\\\.\\pipe\\${name}`
-    : join(tmpdir(), `${name}.sock`);
+  const pipeName = `yuketang-helper-cli-${process.pid}-${Date.now()}-${Math.random()}`;
+  const socketPath = join('/tmp', `${randomUUID()}.sock`);
+  return process.platform === 'win32' ? `\\\\.\\pipe\\${pipeName}` : socketPath;
 }
 
 async function leaveStaleSocket(pipePath: string): Promise<void> {

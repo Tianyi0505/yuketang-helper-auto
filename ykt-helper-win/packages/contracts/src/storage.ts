@@ -34,6 +34,7 @@ export interface AppSettings {
   readonly autoAnswerDelay: number;
   readonly autoAnswerRandomDelay: number;
   readonly keepScreenAwake: boolean;
+  readonly autoRestartEnabled: boolean;
   readonly aiAnalyzeLatestOnOpen: boolean;
   readonly aiSlidePickPriority: boolean;
   readonly aiCaptureCurrentPage: boolean;
@@ -72,6 +73,7 @@ export const DefaultAppSettings: AppSettings = Object.freeze({
   autoAnswerDelay: 3000,
   autoAnswerRandomDelay: 2000,
   keepScreenAwake: false,
+  autoRestartEnabled: false,
   aiAnalyzeLatestOnOpen: false,
   aiSlidePickPriority: true,
   aiCaptureCurrentPage: true,

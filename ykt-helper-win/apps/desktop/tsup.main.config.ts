@@ -4,6 +4,7 @@ export default defineConfig({
   entry: {
     index: 'main/index.ts',
     'web-probe-worker': 'main/web-probe-worker.ts',
+    'restart-supervisor': 'main/restart-supervisor.ts',
     'development-network-recorder': 'main/development-network-recorder.ts',
   },
   format: ['cjs'],

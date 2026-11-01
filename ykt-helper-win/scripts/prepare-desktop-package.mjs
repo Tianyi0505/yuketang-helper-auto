@@ -37,6 +37,12 @@ await Promise.all([
       join(packageRoot, 'main', 'web-probe-worker.cjs'),
     ),
   ),
+  mkdir(join(packageRoot, 'main'), { recursive: true }).then(() =>
+    copyFile(
+      join(root, 'apps', 'desktop', 'dist', 'main', 'restart-supervisor.cjs'),
+      join(packageRoot, 'main', 'restart-supervisor.cjs'),
+    ),
+  ),
   cp(
     join(root, 'apps', 'desktop', 'dist', 'preload'),
     join(packageRoot, 'preload'),
