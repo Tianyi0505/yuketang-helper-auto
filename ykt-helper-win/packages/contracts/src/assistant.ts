@@ -34,6 +34,11 @@ export interface AiProfileConfig {
 
 export interface AiProfileView extends AiProfileConfig {
   readonly hasApiKey: boolean;
+  /**
+   * Masked API key for local display, e.g. `sk-****cdef`. Never carries the
+   * full secret so a screenshot cannot leak it. Null when nothing is stored.
+   */
+  readonly apiKeyMasked: string | null;
 }
 
 export interface ConnectAiProfileInput {

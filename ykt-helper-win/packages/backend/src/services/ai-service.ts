@@ -46,16 +46,22 @@ export class AiService {
     input: ConnectAiProfileInput,
   ): Promise<readonly AiProfileView[]> {
     const baseUrl = normalizeBaseUrl(input.baseUrl);
-    const apiKey = input.apiKey.trim();
-    if (!apiKey) throw new Error('API Key 不能为空。');
     const providerId = input.providerId ?? OPENAI_COMPATIBLE_PROVIDER_ID;
-    const provider = this.provider(providerId);
-    const models = await provider.discoverModels({ baseUrl, apiKey });
     const current = await this.profiles();
     const existing = current.find(
       (profile) =>
         profile.baseUrl === baseUrl && profile.providerId === providerId,
     );
+    // An empty key keeps the stored secret for the same service, so a restart
+    // never forces the user to paste it again.
+    const apiKey = input.apiKey.trim()
+      ? input.apiKey.trim()
+      : ((existing
+          ? await this.secrets.get(credentialKey(existing.id))
+          : null) ?? '');
+    if (!apiKey) throw new Error('API Key 不能为空。');
+    const provider = this.provider(providerId);
+    const models = await provider.discoverModels({ baseUrl, apiKey });
     const id =
       existing?.id ?? uniqueProfileId(profileName(models, baseUrl), current);
     const profile = profileFromDiscovery(
@@ -495,6 +501,7 @@ export class AiService {
     return {
       ...profile,
       hasApiKey: Boolean(main),
+      apiKeyMasked: main === null ? null : maskApiKey(main),
     };
   }
 
@@ -736,6 +743,18 @@ function normalizeBaseUrl(value: string): string {
     .replace(/\/(?:chat\/completions|models)\/?$/i, '')
     .replace(/\/+$/, '');
   return url.toString().replace(/\/$/, '');
+}
+
+/**
+ * Shows just enough of the key to prove it is stored, e.g. `sk-****cdef`.
+ * Short keys are fully hidden; the full value is never returned to the UI.
+ */
+export function maskApiKey(value: string): string {
+  const key = value.trim();
+  if (!key) return '';
+  if (key.length <= 8) return '•'.repeat(key.length);
+  const hidden = '•'.repeat(Math.min(10, key.length - 7));
+  return `${key.slice(0, 3)}${hidden}${key.slice(-4)}`;
 }
 
 function safeImageUrl(value: string): string {

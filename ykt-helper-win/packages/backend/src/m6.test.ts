@@ -168,6 +168,75 @@ describe('M6 facade support', () => {
     await runtime.stop();
   });
 
+  it('reports a masked API key and reuses the stored key on reconnect', async () => {
+    const secretStore = new MemorySecretStore();
+    const fetcher = vi.fn(async (input: string | URL | Request) =>
+      String(input).endsWith('/models')
+        ? new Response(
+            JSON.stringify({
+              data: [
+                { id: 'kimi-k2.6', object: 'model', owned_by: 'moonshot' },
+              ],
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          )
+        : new Response('{}', {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+    );
+    const runtime = new BackendRuntime({ secretStore, fetcher });
+    await runtime.start();
+
+    const connected = await runtime.facade.connectAiProfile({
+      baseUrl: 'https://api.moonshot.cn/v1/chat/completions',
+      apiKey: 'sk-secret-moonshot-key',
+    });
+
+    expect(connected[0]).toEqual(
+      expect.objectContaining({
+        hasApiKey: true,
+        apiKeyMasked: 'sk-••••••••••-key',
+      }),
+    );
+
+    // Reconnecting without a key must reuse the stored secret instead of
+    // demanding a new one, and the model list is discovered again.
+    const reconnected = await runtime.facade.connectAiProfile({
+      baseUrl: 'https://api.moonshot.cn/v1/chat/completions',
+      apiKey: '',
+    });
+
+    expect(reconnected).toHaveLength(1);
+    expect(reconnected[0]?.apiKeyMasked).toBe('sk-••••••••••-key');
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(await secretStore.get('ai-profile:moonshot:main')).toBe(
+      'sk-secret-moonshot-key',
+    );
+
+    const profiles = await runtime.facade.listAiProfiles();
+    expect(profiles[0]).toEqual(
+      expect.objectContaining({
+        hasApiKey: true,
+        apiKeyMasked: 'sk-••••••••••-key',
+      }),
+    );
+    await runtime.stop();
+  });
+
+  it('still refuses a new service without any API key', async () => {
+    const runtime = new BackendRuntime({ fetcher: vi.fn() });
+    await runtime.start();
+
+    await expect(
+      runtime.facade.connectAiProfile({
+        baseUrl: 'https://api.example.com/v1',
+        apiKey: '   ',
+      }),
+    ).rejects.toThrow('API Key 不能为空。');
+    await runtime.stop();
+  });
+
   it('assigns independent LLM, VLM, OCR and Translate models', async () => {
     const fetcher = vi.fn(async (input: string | URL | Request) =>
       String(input).endsWith('/models')

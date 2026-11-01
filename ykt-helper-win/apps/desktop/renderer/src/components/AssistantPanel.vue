@@ -1688,6 +1688,39 @@ async function selectAiProfile(id: string): Promise<void> {
   });
 }
 
+function normalizeAiBaseUrl(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  try {
+    const url = new URL(trimmed);
+    url.search = '';
+    url.hash = '';
+    url.pathname = url.pathname
+      .replace(/\/(?:chat\/completions|models)\/?$/i, '')
+      .replace(/\/+$/, '');
+    return url.toString().replace(/\/$/, '');
+  } catch {
+    return trimmed;
+  }
+}
+
+const draftProfileWithKey = computed<AiProfileView | undefined>(() => {
+  const baseUrl = normalizeAiBaseUrl(aiConnectionDraft.value.baseUrl);
+  if (!baseUrl) return undefined;
+  return aiProfiles.value.find(
+    (profile) =>
+      profile.baseUrl === baseUrl && profile.providerId === 'openai-compatible',
+  );
+});
+const draftKeyIsStored = computed(
+  () => draftProfileWithKey.value?.hasApiKey === true,
+);
+const canConnectProfile = computed(
+  () =>
+    Boolean(aiConnectionDraft.value.baseUrl) &&
+    (draftKeyIsStored.value || Boolean(aiConnectionDraft.value.apiKey.trim())),
+);
+
 async function connectAiProfile(): Promise<void> {
   const draft = aiConnectionDraft.value;
   await run('profile-connect', async () => {
@@ -3343,22 +3376,30 @@ function clamp(value: number, min: number, max: number): number {
                     v-model="aiConnectionDraft.apiKey"
                     type="password"
                     autocomplete="new-password"
-                    placeholder="输入服务提供商的 API Key"
+                    :placeholder="
+                      draftKeyIsStored
+                        ? '留空则复用已保存密钥'
+                        : '输入服务提供商的 API Key'
+                    "
                   />
                 </label>
+                <p v-if="draftKeyIsStored" class="profile-key-hint">
+                  该服务的密钥已保存在本地：<code>{{
+                    draftProfileWithKey?.apiKeyMasked
+                  }}</code>
+                  ，无需重新输入。
+                </p>
                 <button
                   type="submit"
                   class="primary-button full-width"
-                  :disabled="
-                    !aiConnectionDraft.baseUrl ||
-                    !aiConnectionDraft.apiKey ||
-                    busy === 'profile-connect'
-                  "
+                  :disabled="!canConnectProfile || busy === 'profile-connect'"
                 >
                   {{
                     busy === 'profile-connect'
                       ? '正在发现模型'
-                      : '连接并获取模型'
+                      : draftKeyIsStored
+                        ? '复用已保存密钥并刷新模型'
+                        : '连接并获取模型'
                   }}
                 </button>
               </div>
@@ -3393,6 +3434,10 @@ function clamp(value: number, min: number, max: number): number {
                 <div class="profile-card-meta">
                   <span>{{ profile.models.length }} 个模型</span>
                   <span>来自 /models</span>
+                  <span :title="'API Key 已加密保存在本地，仅显示掩码'">
+                    API Key
+                    <code>{{ profile.apiKeyMasked ?? '未配置' }}</code>
+                  </span>
                 </div>
                 <div
                   v-if="aiProfileSelections[profile.id]"
@@ -5313,6 +5358,24 @@ button:focus-visible {
 .profile-card-head strong,
 .profile-card-head div > span {
   display: block;
+}
+
+.profile-key-hint {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-subtle);
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.profile-key-hint code,
+.profile-card-meta code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  word-break: break-all;
 }
 
 .profile-card-head strong {
