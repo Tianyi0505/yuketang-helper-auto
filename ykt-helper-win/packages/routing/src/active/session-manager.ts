@@ -59,8 +59,8 @@ export class SessionManager {
     const credentials = {
       cookieHeader: loaded.cookieHeader,
       // Browser navigation can rotate Authorization independently of requests
-      // issued by the helper. Adopt genuine source changes, while retaining a
-      // newer Set-Auth value until the credential source catches up.
+      // issued by the helper. Adopt genuine source changes (including revoked
+      // tokens), while retaining a newer Set-Auth until the source catches up.
       bearerToken: sourceTokenChanged
         ? loaded.bearerToken
         : current

@@ -38,6 +38,8 @@ export interface Problem {
   options: readonly string[];
   blanks: readonly string[];
   result: AnswerValue | null;
+  /** Published exercise collected from the official classroom review. */
+  source?: 'classroom-report';
 }
 
 export interface Slide {

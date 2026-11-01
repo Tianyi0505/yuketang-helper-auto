@@ -74,13 +74,13 @@ function parseLessons(value: unknown): readonly ActiveLesson[] {
   const raw =
     array(payload) ??
     array(data?.onLessonClassrooms) ??
-    array(data?.on_lesson_classrooms) ??
-    [];
+    array(data?.on_lesson_classrooms);
+  if (!raw) throw new Error('Response has no current classroom list.');
   return raw.flatMap((item) => {
     const lesson = record(item);
-    if (!lesson) return [];
+    if (!lesson) throw new Error('Invalid current classroom record.');
     const id = stringId(lesson.lessonId ?? lesson.lesson_id ?? lesson.id);
-    if (!id) return [];
+    if (!id) throw new Error('Current classroom has no lesson ID.');
     return [
       {
         id,

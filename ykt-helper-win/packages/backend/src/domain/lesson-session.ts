@@ -33,14 +33,16 @@ export class LessonSession {
 
   setLessonStatus(status: Lesson['status']): void {
     this.#lesson = { ...this.#lesson, status };
+    if (status === 'ended') {
+      for (const [id, state] of this.problemStates) {
+        if (state.status === 'available') this.closeProblem(id);
+      }
+    }
   }
 
   updateLesson(lesson: Lesson): void {
-    this.#lesson = {
-      ...this.#lesson,
-      status: lesson.status,
-      title: lesson.title || this.#lesson.title,
-    };
+    this.#lesson = { ...lesson, title: lesson.title || this.#lesson.title };
+    this.setLessonStatus(lesson.status);
   }
 
   upsertPresentation(presentation: Presentation): void {
@@ -53,6 +55,9 @@ export class LessonSession {
 
   upsertProblem(problem: Problem): void {
     const existing = this.problems.get(problem.id);
+    // Once a review identified the published exercise, generic courseware
+    // refreshes must not replace its image binding or submission route.
+    if (existing?.source === 'classroom-report' && !problem.source) return;
     const merged =
       existing && existing.result !== null && problem.result === null
         ? { ...problem, result: existing.result }
@@ -68,8 +73,13 @@ export class LessonSession {
         unlockedAt: null,
         deadlineAt: null,
       });
-    } else if (merged.result !== null && state.status !== 'answered') {
-      this.problemStates.set(problem.id, { ...state, status: 'answered' });
+    } else {
+      this.problemStates.set(problem.id, {
+        ...state,
+        presentationId: merged.presentationId,
+        slideId: merged.slideId,
+        status: merged.result !== null ? 'answered' : state.status,
+      });
     }
   }
 

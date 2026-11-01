@@ -65,6 +65,8 @@ export class LessonStateMachine {
   private unlock(
     event: Extract<LessonEvent, { type: 'problem.unlocked' }>,
   ): TransitionResult {
+    if (this.session.lesson.status === 'ended')
+      return rejected('lesson has ended');
     const problem = this.session.problems.get(event.problemId);
     if (!problem) return rejected('problem is not loaded');
     if (!this.session.presentations.has(event.presentationId)) {

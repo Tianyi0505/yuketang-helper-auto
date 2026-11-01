@@ -8,7 +8,9 @@ import { queryAI, queryAIVision} from '../ai/openai.js';
 import { showAutoAnswerPopup } from '../ui/panels/auto-answer-popup.js';
 import { formatProblemForVision, parseAIAnswer } from '../tsm/ai-format.js';
 import { captureSlideImage, captureProblemForVision } from '../capture/screenshoot.js';  
-import { getOnLesson, checkinClass } from '../net/xhr-interceptor.js';
+import { getOnLesson, checkinClass, getActivePresentationId, fetchPresentation } from '../net/xhr-interceptor.js';
+import { lookupById } from './repo-lookup.js';
+import { rememberUnlock, takeResolvableUnlocks } from './pending-unlocks.js';
 import { connectOrAttachLessonWS } from '../net/ws-interceptor.js';
 import { createEventReminder, createPublishReminder } from './publish-reminder.js';
 import { screenWakeLock } from '../core/screen-wake-lock.js';
@@ -273,6 +275,7 @@ export const actions = {
       }
     }
     ui.updatePresentationList();
+    this.replayPendingUnlocks();
   },
 
   onUnlockProblem(data, { notificationOnly = false } = {}) {
@@ -286,11 +289,17 @@ export const actions = {
       payload.id,
     );
     const slideId = firstValue(payload.sid, payload.slideId, payload.slide?.id);
-    const problem = repo.problems.get(problemId);
-    const slide = repo.slides.get(slideId);
+    const problem = lookupById(repo.problems, problemId);
+    const slide = lookupById(repo.slides, slideId);
     if (!problem || !slide) {
       if (notificationOnly) return notifyProblemStart(payload, problem, slide);
-      console.log('[雨课堂助手][ERR][onUnlockProblem] 题目或幻灯片不存在');
+      // 自动进入的课堂常常先收到解锁事件、后拿到课件：先暂存，待课件载入后重放
+      if (rememberUnlock(repo.pendingUnlocks, problemId, payload)) {
+        console.log('[雨课堂助手][WARN][onUnlockProblem] 课件尚未载入，暂存解锁事件:', problemId);
+        void this.ensureLessonPresentation(repo.currentLessonId);
+      } else {
+        console.log('[雨课堂助手][ERR][onUnlockProblem] 题目或幻灯片不存在');
+      }
       return false;
     }
 
@@ -329,6 +338,51 @@ export const actions = {
     
     ui.updateActiveProblems();
     return notified;
+  },
+
+  /**
+   * 确保指定课堂的课件已载入。
+   * 自动进入的课堂不会由站点自身发起 presentation/fetch，
+   * 缺少课件时 repo.problems/slides 为空，解锁事件无法匹配到题目。
+   */
+  async ensureLessonPresentation(lessonId) {
+    const id = lessonId || repo.currentLessonId;
+    if (!id) return null;
+    if (repo.lessonPresentationLoading.has(id)) return null;
+    repo.lessonPresentationLoading.add(id);
+    try {
+      const presentationId = await getActivePresentationId(id);
+      if (!presentationId) return null;
+      if (repo.presentations.has(presentationId)) {
+        this.replayPendingUnlocks();
+        return presentationId;
+      }
+      const data = await fetchPresentation(presentationId, { auth: repo.lessonTokens.get(id) });
+      if (!data) return null;
+      this.onPresentationLoaded(presentationId, data);
+      console.log('[雨课堂助手][INFO][ensureLessonPresentation] 课件已载入:', presentationId);
+      return presentationId;
+    } catch (e) {
+      console.error('[雨课堂助手][ERR][ensureLessonPresentation] 拉取课件失败:', id, e);
+      return null;
+    } finally {
+      repo.lessonPresentationLoading.delete(id);
+    }
+  },
+
+  /** 课件载入后重放此前暂存的解锁事件。 */
+  replayPendingUnlocks() {
+    const store = repo.pendingUnlocks;
+    if (!store || store.size === 0) return 0;
+    const ready = takeResolvableUnlocks(store, (problemId, payload) => {
+      const slideId = firstValue(payload?.sid, payload?.slideId, payload?.slide?.id);
+      return !!lookupById(repo.problems, problemId) && !!lookupById(repo.slides, slideId);
+    });
+    for (const { problemId, payload } of ready) {
+      console.log('[雨课堂助手][INFO][replayPendingUnlocks] 重放解锁事件:', problemId);
+      this.onUnlockProblem(payload);
+    }
+    return ready.length;
   },
 
   onPublishEvent(event) {
@@ -466,6 +520,9 @@ export const actions = {
             connectOrAttachLessonWS({ lessonId, auth: token });
             // 标记该课堂为“自动进入”
             repo.markLessonAutoJoined(lessonId, true);
+            // 自动进入的课堂没有站点自身的课件请求，必须主动拉取，
+            // 否则解锁事件匹配不到题目，自动作答不会触发
+            void this.ensureLessonPresentation(lessonId);
             if (ui.config.autoAnswerOnAutoJoin) {
               repo.forceAutoAnswerLessons.add(lessonId);
             }

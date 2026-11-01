@@ -73,6 +73,12 @@ function setupPanel() {
   };
   panel.problems.value = [problem];
   panel.selectedLessonId.value = 'l1';
+  api.listProblems.mockImplementation(async (lessonId) =>
+    panel.problems.value.filter((item) => item.lessonId === lessonId),
+  );
+  api.listPresentations.mockImplementation(
+    async () => panel.presentations.value,
+  );
   return { panel, api, problem, emit, props };
 }
 
@@ -93,6 +99,7 @@ describe('automatic draft-only answers', () => {
           }),
       );
       const analysis = panel.analyzeProblem(true);
+      await vi.advanceTimersByTimeAsync(0);
       if (when === 'while pending') panel.answerDraft.value = 'B';
       await nextTick();
       panel.confirmed.value = true;
@@ -146,6 +153,7 @@ describe('automatic draft-only answers', () => {
         }),
     );
     const analysis = panel.analyzeProblem(true);
+    await vi.advanceTimersByTimeAsync(0);
     panel.answerDraft.value = 'B';
     await nextTick();
     panel.selectedProblemId.value = 'p2';
@@ -191,6 +199,7 @@ describe('automatic draft-only answers', () => {
         }),
     );
     const analysis = panel.analyzeProblem(true);
+    await vi.advanceTimersByTimeAsync(0);
     panel.answerDraft.value = 'B';
     await nextTick();
     panel.selectedProblemId.value = 'p2';
@@ -367,6 +376,7 @@ describe('automatic draft-only answers', () => {
         }),
     );
     const analysis = panel.analyzeProblem(true);
+    await vi.advanceTimersByTimeAsync(0);
     panel.settings.value.llmManagedSubmit = true;
     resolve({
       id: 'proposal-p1',
@@ -424,6 +434,7 @@ describe('automatic draft-only answers', () => {
           }),
       );
       const analysis = panel.analyzeProblem(true);
+      await vi.advanceTimersByTimeAsync(0);
       if (reason === 'lesson changed') panel.selectedLessonId.value = 'l2';
       else panel.problems.value = [{ ...problem, deadlineAt: Date.now() - 1 }];
       resolve({
@@ -452,6 +463,7 @@ describe('automatic draft-only answers', () => {
         }),
     );
     const analysis = panel.analyzeProblem(true);
+    await vi.advanceTimersByTimeAsync(0);
     panel.selectedProblemId.value = 'p2';
     await nextTick();
     panel.answerDraft.value = 'B';

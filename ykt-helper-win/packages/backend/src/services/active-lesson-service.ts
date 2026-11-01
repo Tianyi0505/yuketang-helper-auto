@@ -12,9 +12,11 @@ import {
   type ProblemContext,
   type SubmissionResult,
   type UserProfile,
+  type JsonValue,
 } from '@ykt/contracts';
 import {
   normalizeTimestamp,
+  ActiveRequestError,
   type ActiveLesson,
   type BrowserArchivedPresentationObservation,
   type YuketangActiveClient,
@@ -40,6 +42,7 @@ export function isClassroomSimulationLesson(lessonId: string): boolean {
 
 export class ActiveLessonService {
   readonly #remoteLessons = new Map<string, ActiveLesson>();
+  readonly #endedLessonIds = new Set<string>();
   readonly #environments = new Map<string, BrowserEnvironment>();
   readonly #problems: ProblemService;
   readonly #answers = new AnswerService();
@@ -50,7 +53,8 @@ export class ActiveLessonService {
     Map<string, Record<string, unknown>>
   >();
   readonly #pendingPublishes = new Map<string, Record<string, unknown>[]>();
-  readonly #connectedLessons = new Map<BrowserEnvironment, string>();
+  /** In-flight presentation fetches keyed by lesson and presentation. */
+  readonly #presentationLoads = new Map<string, Promise<boolean>>();
   #simulation: ClassroomSimulationState = {
     lessonId: simulationLessonId,
     status: 'upcoming',
@@ -91,7 +95,17 @@ export class ActiveLessonService {
     if (archivedLessonId)
       await this.client.collectArchivedReport(environment, archivedLessonId);
     const lessons = await this.client.listLessons(environment);
+    const activeIds = new Set(lessons.map((lesson) => lesson.id));
+    // on-lesson is the complete current classroom list. A closed tab can miss
+    // lessonfinished, so successful refreshes also retire absent classrooms.
+    for (const [id] of this.#remoteLessons) {
+      if (this.#environments.get(id) === environment && !activeIds.has(id)) {
+        await this.finishLesson(id);
+      }
+    }
     for (const lesson of lessons) {
+      // A delayed response must not resurrect a classroom already ended by WS.
+      if (this.#endedLessonIds.has(lesson.id)) continue;
       this.#remoteLessons.set(lesson.id, lesson);
       this.#environments.set(lesson.id, environment);
       this.repository.upsertLesson({
@@ -137,39 +151,42 @@ export class ActiveLessonService {
       );
     }
     if (!this.client.usesBrowserCollection && remote.presentationId) {
-      const presentation = await this.client.fetchPresentation(
-        connectedEnvironment,
-        lessonId,
-        remote.presentationId,
-      );
-      await this.applyPresentation(
-        connectedEnvironment,
-        lessonId,
-        presentation,
-      );
+      try {
+        const presentation = await this.client.fetchPresentation(
+          connectedEnvironment,
+          lessonId,
+          remote.presentationId,
+        );
+        await this.applyPresentation(
+          connectedEnvironment,
+          lessonId,
+          presentation,
+        );
+      } catch (error) {
+        // The classroom page usually loads the same presentation a moment
+        // later. A failed prefetch must not prevent event collection, or the
+        // lesson stays unknown until the next full reconnect.
+        await this.storage.appendLog({
+          level: 'warn',
+          scope: 'lesson',
+          message: '连接课堂时预取课件失败，将继续监听课堂事件。',
+          details: {
+            lessonId,
+            presentationId: remote.presentationId,
+            error: error instanceof Error ? error.message : 'Unknown error',
+          },
+        });
+      }
     }
     this.#environments.set(lessonId, connectedEnvironment);
-    const previousLessonId = this.#connectedLessons.get(connectedEnvironment);
-    if (previousLessonId && previousLessonId !== lessonId) {
-      this.client.closeLesson(previousLessonId);
-      await this.storage.appendLog({
-        level: 'info',
-        scope: 'lesson',
-        message: '已切换官方课堂采集器。',
-        details: {
-          environment: connectedEnvironment,
-          previousLessonId,
-          lessonId,
-        },
-      });
+    if (remote.status !== 'ended') {
+      this.client.connectLesson(
+        connectedEnvironment,
+        lessonId,
+        (message) => this.handleMessage(lessonId, message),
+        remote.presentationId,
+      );
     }
-    this.client.connectLesson(
-      connectedEnvironment,
-      lessonId,
-      (message) => this.handleMessage(lessonId, message),
-      remote.presentationId,
-    );
-    this.#connectedLessons.set(connectedEnvironment, lessonId);
     return connectedEnvironment;
   }
 
@@ -202,7 +219,7 @@ export class ActiveLessonService {
       environment,
       problem,
       validation.normalizedAnswer,
-      input.forceRetry ?? false,
+      input,
     );
     this.repository
       .getSession(problem.lessonId)
@@ -219,7 +236,7 @@ export class ActiveLessonService {
     environment: BrowserEnvironment,
     problem: ProblemContext,
     answer: AnswerValue,
-    forceRetry: boolean,
+    input: AnswerInput,
     retried = false,
   ): Promise<'answer' | 'retry'> {
     const plan = planSubmission({
@@ -228,15 +245,58 @@ export class ActiveLessonService {
       now: this.clock.now(),
       startTime: problem.unlockedAt,
       endTime: problem.deadlineAt,
-      ...(forceRetry ? { forceRetry: true } : {}),
+      ...(input.forceRetry || problem.source === 'classroom-report'
+        ? { forceRetry: true }
+        : {}),
+    });
+    const startedAt = this.clock.now();
+    const context = {
+      environment,
+      lessonId: problem.lessonId,
+      problemId: problem.id,
+      proposalId: input.proposalId ?? null,
+      confirmedBy: input.confirmedBy ?? 'user',
+      route: plan.route,
+      attempt: retried ? 2 : 1,
+      deadlineAt: problem.deadlineAt,
+      remainingMs:
+        problem.deadlineAt === null ? null : problem.deadlineAt - startedAt,
+    };
+    await this.logSubmission('info', '开始提交答案请求。', {
+      ...context,
+      stage: 'submit-started',
     });
     try {
+      if (
+        input.confirmedBy === 'agent' &&
+        problem.source !== 'classroom-report' &&
+        this.repository.getSession(problem.lessonId)?.lesson.status !== 'active'
+      ) {
+        throw new Error('课堂已结束，已取消自动提交。');
+      }
       await this.client.submit(environment, problem.lessonId, plan);
+      await this.logSubmission('info', '答案请求已被服务端接受。', {
+        ...context,
+        stage: 'submit-succeeded',
+        elapsedMs: this.clock.now() - startedAt,
+      });
       return plan.route;
     } catch (error) {
-      if (retried || !this.#isTokenExpiredError(error)) {
+      const willRefresh = !retried && this.#isTokenExpiredError(error);
+      await this.logSubmission('error', '答案请求失败。', {
+        ...context,
+        stage: 'submit-failed',
+        elapsedMs: this.clock.now() - startedAt,
+        willRefresh,
+        ...submissionErrorDetails(error),
+      });
+      if (!willRefresh) {
         throw error;
       }
+      await this.logSubmission('info', '开始刷新课堂凭据。', {
+        ...context,
+        stage: 'credential-refresh-started',
+      });
       try {
         const refreshed = await this.client.checkin(
           environment,
@@ -249,7 +309,16 @@ export class ActiveLessonService {
             message: 'Unable to refresh the lesson token.',
           });
         }
+        await this.logSubmission('info', '课堂凭据已刷新，准备重试提交。', {
+          ...context,
+          stage: 'credential-refresh-succeeded',
+        });
       } catch (refreshError) {
+        await this.logSubmission('error', '课堂凭据刷新失败，未重试提交。', {
+          ...context,
+          stage: 'credential-refresh-failed',
+          ...submissionErrorDetails(refreshError),
+        });
         const submitError = errorMessage(error);
         const refreshErrorMessage = errorMessage(refreshError);
         throw new YuketangError({
@@ -272,17 +341,36 @@ export class ActiveLessonService {
         environment,
         problem,
         answer,
-        forceRetry,
+        input,
         true,
       );
     }
   }
 
-  #isTokenExpiredError(error: unknown): boolean {
-    if (error instanceof Error) {
-      return error.message.includes('code 50004');
+  private async logSubmission(
+    level: 'info' | 'error',
+    message: string,
+    details: Record<string, JsonValue>,
+  ): Promise<void> {
+    try {
+      await this.storage.appendLog({
+        level,
+        scope: 'answer-request',
+        message,
+        details,
+      });
+    } catch {
+      // Diagnostics must not prevent submission or change its result.
     }
-    return false;
+  }
+
+  #isTokenExpiredError(error: unknown): boolean {
+    // 50004 means "class is over", not expired credentials. Never mask it
+    // with a secondary checkin failure. Only explicit HTTP authentication
+    // rejection is eligible for the existing one-time refresh/retry.
+    return (
+      error instanceof ActiveRequestError && error.diagnostic.httpStatus === 401
+    );
   }
 
   getSimulation(): ClassroomSimulationState {
@@ -373,13 +461,48 @@ export class ActiveLessonService {
     this.#stopArchivedCollection();
     this.#pendingUnlocks.clear();
     this.#pendingPublishes.clear();
-    this.#connectedLessons.clear();
     this.client.close();
+  }
+
+  private async finishLesson(
+    lessonId: string,
+    keepSessionToken = false,
+  ): Promise<void> {
+    const session = this.repository.getSession(lessonId);
+    const wasActive = session?.lesson.status === 'active';
+    const firstFinish = !this.#endedLessonIds.has(lessonId);
+    this.#endedLessonIds.add(lessonId);
+    this.#remoteLessons.delete(lessonId);
+    this.#pendingUnlocks.delete(lessonId);
+    this.#pendingPublishes.delete(lessonId);
+    this.client.closeLesson(lessonId, keepSessionToken);
+    session?.setLessonStatus('ended');
+    if (firstFinish) {
+      await this.storage.appendLog({
+        level: 'info',
+        scope: 'lesson',
+        message: '课堂已结束，已停止监听。',
+        details: { lessonId },
+      });
+    }
+    if (wasActive) {
+      this.emitNotice({
+        kind: 'lesson-finished',
+        lessonId,
+        dedupeKey: `lesson-finished:${lessonId}`,
+        title: '课堂已结束',
+        detail: session.lesson.title,
+        occurredAt: this.clock.now(),
+      });
+    }
   }
 
   private async applyArchivedPresentation(
     observation: BrowserArchivedPresentationObservation,
   ): Promise<void> {
+    // Keep the lesson credential: review exercises are submitted through the
+    // official retry endpoint after the class itself has already ended.
+    await this.finishLesson(observation.lessonId, true);
     this.repository.upsertLesson({
       id: observation.lessonId,
       title:
@@ -396,6 +519,23 @@ export class ActiveLessonService {
       observation.lessonId,
       observation.presentation,
     );
+    const session = this.repository.getSession(observation.lessonId)!;
+    for (const slide of observation.presentation.slides) {
+      const problem = slide.problem;
+      if (problem?.source !== 'classroom-report') continue;
+      const start = observation.problemStarts?.[problem.id];
+      if (start !== undefined) {
+        session.unlockProblem(
+          problem.id,
+          problem.presentationId,
+          problem.slideId,
+          start,
+          null,
+          this.clock.now(),
+        );
+      }
+      session.closeProblem(problem.id);
+    }
   }
 
   private async handleMessage(lessonId: string, value: unknown): Promise<void> {
@@ -426,23 +566,10 @@ export class ActiveLessonService {
     const event = getRealtimeEvent(message);
     if (!event) return;
     if (event.kind === 'lessonfinished') {
-      this.#pendingUnlocks.delete(lessonId);
-      this.#pendingPublishes.delete(lessonId);
-      machine.apply({
-        type: 'lesson.ended',
-        lessonId,
-        occurredAt: this.clock.now(),
-      });
-      this.emitNotice({
-        kind: 'lesson-finished',
-        lessonId,
-        dedupeKey: `lesson-finished:${lessonId}`,
-        title: '课堂已结束',
-        detail: session.lesson.title,
-        occurredAt: this.clock.now(),
-      });
+      await this.finishLesson(lessonId);
       return;
     }
+    if (session.lesson.status === 'ended' && event.kind !== 'answered') return;
     if (event.kind === 'timeline') {
       const timeline = Array.isArray(event.timeline) ? event.timeline : [];
       for (const item of timeline) {
@@ -531,6 +658,7 @@ export class ActiveLessonService {
     lessonId: string,
     unlocked: Record<string, unknown>,
   ): Promise<void> {
+    if (machine.session.lesson.status === 'ended') return;
     const problemId = stringId(
       unlocked.problemId ?? unlocked.problem_id ?? unlocked.prob ?? unlocked.id,
     );
@@ -538,21 +666,29 @@ export class ActiveLessonService {
       await this.logUnlockBindingIssue(lessonId, null, 'problem id is missing');
       return;
     }
-    const problem = machine.session.problems.get(problemId);
+    let problem = machine.session.problems.get(problemId);
     if (!problem) {
-      if (this.deferUnlock(lessonId, problemId, unlocked)) {
-        await this.storage.appendLog({
-          level: 'info',
-          scope: 'lesson',
-          message: '题目事件等待课件绑定。',
-          details: {
-            lessonId,
-            problemId,
-            reason: 'problem is not loaded',
-          },
-        });
+      // Network capture can start after the official page fetched its deck, or
+      // the deck response can belong to another tab. The unlock event carries
+      // the presentation ID, so load exactly that deck instead of waiting for
+      // an observation that may never repeat.
+      await this.ensurePresentationForUnlock(lessonId, unlocked, false);
+      problem = machine.session.problems.get(problemId);
+      if (!problem) {
+        if (this.deferUnlock(lessonId, problemId, unlocked)) {
+          await this.storage.appendLog({
+            level: 'info',
+            scope: 'lesson',
+            message: '题目事件等待课件绑定。',
+            details: {
+              lessonId,
+              problemId,
+              reason: 'problem is not loaded',
+            },
+          });
+        }
+        return;
       }
-      return;
     }
     const unlockedAt =
       normalizeTimestamp(unlocked.dt ?? unlocked.unlockedAt) ??
@@ -583,8 +719,8 @@ export class ActiveLessonService {
         },
       });
     }
-    const result = machine.apply({
-      type: 'problem.unlocked',
+    const transition = {
+      type: 'problem.unlocked' as const,
       lessonId,
       occurredAt: this.clock.now(),
       problemId,
@@ -595,7 +731,28 @@ export class ActiveLessonService {
         limitSeconds !== null && limitSeconds > 0
           ? unlockedAt + limitSeconds * 1000
           : null,
-    });
+    };
+    let result = machine.apply(transition);
+    if (
+      !result.applied &&
+      (result.reason === 'presentation is not loaded' ||
+        result.reason === 'slide is not loaded')
+    ) {
+      // The problem exists in an already stored deck but its slide is missing
+      // (a stale or partial fetch). Reloading the deck is the only way to bind
+      // this unlock, so force the request even when a deck is cached.
+      if (await this.ensurePresentationForUnlock(lessonId, unlocked, true)) {
+        const refreshed = machine.session.problems.get(problemId);
+        if (refreshed) {
+          problem = refreshed;
+          result = machine.apply({
+            ...transition,
+            presentationId: refreshed.presentationId,
+            slideId: refreshed.slideId,
+          });
+        }
+      }
+    }
     if (!result.applied) {
       if (
         result.reason === 'presentation is not loaded' ||
@@ -629,6 +786,73 @@ export class ActiveLessonService {
       detail: problem.prompt || '教师开启了一道可作答的习题',
       occurredAt: this.clock.now(),
     });
+  }
+
+  /**
+   * Loads the presentation named by an unlock event. Returns true when a deck
+   * was fetched and applied, false when there is nothing new to load.
+   */
+  private async ensurePresentationForUnlock(
+    lessonId: string,
+    unlocked: Record<string, unknown>,
+    force: boolean,
+  ): Promise<boolean> {
+    if (this.#endedLessonIds.has(lessonId)) return false;
+    const presentationId =
+      stringId(
+        unlocked.pres ??
+          unlocked.presentationId ??
+          unlocked.presentation_id ??
+          unlocked.presentation,
+      ) ??
+      this.#remoteLessons.get(lessonId)?.presentationId ??
+      null;
+    const environment = this.#environments.get(lessonId);
+    if (!presentationId || !environment) return false;
+    const session = this.repository.getSession(lessonId);
+    if (!session) return false;
+    if (!force && session.presentations.has(presentationId)) return false;
+
+    const key = `${lessonId}:${presentationId}:${force ? 'refresh' : 'load'}`;
+    const running = this.#presentationLoads.get(key);
+    if (running) return running;
+    const task = (async (): Promise<boolean> => {
+      try {
+        const presentation = await this.client.fetchPresentation(
+          environment,
+          lessonId,
+          presentationId,
+        );
+        if (presentation.lessonId !== lessonId) return false;
+        // Drop the in-flight marker before replaying pending unlocks; the
+        // replay can legitimately hit this presentation again.
+        this.#presentationLoads.delete(key);
+        await this.applyPresentation(environment, lessonId, presentation);
+        await this.storage.appendLog({
+          level: 'info',
+          scope: 'lesson',
+          message: '已按题目事件补取课件。',
+          details: { lessonId, presentationId },
+        });
+        return true;
+      } catch (error) {
+        await this.storage.appendLog({
+          level: 'warn',
+          scope: 'lesson',
+          message: '按题目事件补取课件失败。',
+          details: {
+            lessonId,
+            presentationId,
+            error: error instanceof Error ? error.message : 'Unknown error',
+          },
+        });
+        return false;
+      } finally {
+        this.#presentationLoads.delete(key);
+      }
+    })();
+    this.#presentationLoads.set(key, task);
+    return task;
   }
 
   private async applyProblemFromPublish(
@@ -840,6 +1064,13 @@ export class ActiveLessonService {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function submissionErrorDetails(error: unknown): Record<string, JsonValue> {
+  return {
+    error: error instanceof Error ? error.message : 'Unknown error',
+    ...(error instanceof ActiveRequestError ? error.diagnostic : {}),
+  };
 }
 
 function record(value: unknown): Record<string, unknown> | null {

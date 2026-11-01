@@ -10,7 +10,13 @@ export async function enterActiveLessons(
     if (lesson.status !== 'active' || connectedLessonIds.has(lesson.id)) {
       continue;
     }
-    await enterLesson(lesson.id);
+    try {
+      await enterLesson(lesson.id);
+    } catch {
+      // A stale classroom or transient failure must not block the next class.
+      // Failed entries are left unconnected and retried at the next poll.
+      continue;
+    }
     connectedLessonIds.add(lesson.id);
     enteredLessonIds.push(lesson.id);
   }

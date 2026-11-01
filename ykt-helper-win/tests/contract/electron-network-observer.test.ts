@@ -5,8 +5,195 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { ElectronNetworkObserver } from '../../apps/desktop/main/electron-network-observer.js';
 import { DevelopmentNetworkRecorder } from '../../apps/desktop/main/development-network-recorder.js';
+import reportFixture from '../fixtures/classroom-report.json';
 
 describe('Electron classroom network observer', () => {
+  it('binds sockets per browser tab, preserves an early hello, and releases closed-tab bindings', async () => {
+    const collector = new BrowserLessonCollector();
+    const first = new FakeContents(1);
+    const second = new FakeContents(2);
+    const observers = [first, second].map(
+      (contents) =>
+        new ElectronNetworkObserver(
+          contents as never,
+          new NetworkRecorder(),
+          vi.fn(),
+          collector,
+          false,
+        ),
+    );
+    await Promise.all(observers.map((observer) => observer.start()));
+    const send = (
+      contents: FakeContents,
+      direction: 'Sent' | 'Received',
+      message: unknown,
+    ) =>
+      contents.debugger.emit(
+        'message',
+        {},
+        `Network.webSocketFrame${direction}`,
+        {
+          requestId: 'socket-1',
+          response: { payloadData: JSON.stringify(message) },
+        },
+      );
+    send(first, 'Sent', { op: 'hello', lessonid: 'old' });
+    send(second, 'Sent', { op: 'hello', lessonid: 'new' });
+    const oldListener = vi.fn();
+    const newListener = vi.fn();
+    collector.watchLesson('standard', 'old', null, oldListener);
+    collector.watchLesson('standard', 'new', null, newListener);
+    send(first, 'Received', { op: 'unlockproblem', problem: 1 });
+    send(second, 'Received', { op: 'unlockproblem', problem: 2 });
+    expect(oldListener).toHaveBeenCalledWith({
+      type: 'message',
+      message: { op: 'unlockproblem', problem: 1 },
+    });
+    expect(newListener).toHaveBeenCalledWith({
+      type: 'message',
+      message: { op: 'unlockproblem', problem: 2 },
+    });
+    observers[0]!.destroy();
+    send(first, 'Received', { op: 'unlockproblem', problem: 3 });
+    send(second, 'Received', { op: 'unlockproblem', problem: 4 });
+    expect(oldListener).toHaveBeenCalledTimes(1);
+    expect(newListener).toHaveBeenCalledTimes(2);
+    observers[1]!.destroy();
+  });
+  it.each(['review', 'detail', 'lesson-info'] as const)(
+    'captures classroom report %s without deep capture',
+    async (endpoint) => {
+      const collector = new BrowserLessonCollector();
+      const listener = vi.fn();
+      collector.onArchivedPresentation(listener);
+      const contents = new FakeContents();
+      const observer = new ElectronNetworkObserver(
+        contents as never,
+        new NetworkRecorder(),
+        vi.fn(),
+        collector,
+        false,
+      );
+      await observer.start();
+      const body =
+        endpoint === 'review'
+          ? reportFixture.review
+          : endpoint === 'detail'
+            ? reportFixture.detail
+            : reportFixture.lessonInfo;
+      const url = `https://www.yuketang.cn/api/v3/classroom-report/student/${endpoint}?lesson_id=${reportFixture.lessonId}`;
+      const observe = vi.spyOn(collector, 'observeHttp');
+      contents.debugger.responseBody = JSON.stringify(body);
+      contents.debugger.emit('message', {}, 'Network.requestWillBeSent', {
+        requestId: 'report',
+        request: { url, method: 'GET' },
+      });
+      contents.debugger.emit('message', {}, 'Network.responseReceived', {
+        requestId: 'report',
+        type: 'XHR',
+        response: { url, status: 200, mimeType: 'application/json' },
+      });
+      contents.debugger.emit('message', {}, 'Network.loadingFinished', {
+        requestId: 'report',
+        encodedDataLength: 1000,
+      });
+      await vi.waitFor(() =>
+        expect(observe).toHaveBeenCalledWith(
+          expect.objectContaining({ body: JSON.stringify(body) }),
+        ),
+      );
+      if (endpoint !== 'lesson-info') {
+        expect(listener).toHaveBeenCalledWith(
+          expect.objectContaining({
+            presentation: expect.objectContaining({
+              slides: expect.arrayContaining([
+                expect.objectContaining({
+                  id: '1900000000000000100',
+                  index: 8,
+                  problem: expect.objectContaining({
+                    id: '1900000000000000100',
+                    result: null,
+                    source: 'classroom-report',
+                  }),
+                }),
+              ]),
+            }),
+          }),
+        );
+      }
+    },
+  );
+
+  it('does not attach a different deck to the only watched lesson, but allows its own page to switch decks', async () => {
+    const collector = new BrowserLessonCollector();
+    const listener = vi.fn();
+    collector.watchLesson('standard', 'lesson-1', 'deck-1', listener);
+    const response = {
+      statusCode: 200,
+      url: 'https://www.yuketang.cn/api/v3/lesson/presentation/fetch?presentation_id=deck-2',
+      body: JSON.stringify({
+        data: {
+          id: 'deck-2',
+          slides: [
+            { id: 's', problem: { problemId: 'wrong', problemType: 1 } },
+          ],
+        },
+      }),
+    };
+    await collector.observeHttp(response);
+    await collector.observeHttp({
+      ...response,
+      pageUrl: 'https://www.yuketang.cn/lesson/fullscreen/v3/lesson-2/ppt/1',
+    });
+    expect(listener).not.toHaveBeenCalled();
+    await collector.observeHttp({
+      ...response,
+      pageUrl: 'https://www.yuketang.cn/lesson/fullscreen/v3/lesson-1/ppt/1',
+    });
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the requesting classroom when the page navigates before a deck finishes loading', async () => {
+    const collector = new BrowserLessonCollector();
+    const oldLesson = vi.fn();
+    const newLesson = vi.fn();
+    collector.watchLesson('standard', 'old', null, oldLesson);
+    collector.watchLesson('standard', 'new', null, newLesson);
+    const contents = new FakeContents();
+    const observer = new ElectronNetworkObserver(
+      contents as never,
+      new NetworkRecorder(),
+      vi.fn(),
+      collector,
+      false,
+    );
+    await observer.start();
+    const url =
+      'https://www.yuketang.cn/api/v3/lesson/presentation/fetch?presentation_id=deck';
+    contents.debugger.responseBody = JSON.stringify({
+      data: { id: 'deck', slides: [] },
+    });
+    contents.debugger.emit('message', {}, 'Network.requestWillBeSent', {
+      requestId: 'deck',
+      documentURL: 'https://www.yuketang.cn/lesson/fullscreen/v3/old/ppt/1',
+      request: { method: 'GET', url },
+    });
+    vi.spyOn(contents, 'getURL').mockReturnValue(
+      'https://www.yuketang.cn/lesson/fullscreen/v3/new/ppt/1',
+    );
+    contents.debugger.emit('message', {}, 'Network.responseReceived', {
+      requestId: 'deck',
+      type: 'XHR',
+      response: { url, status: 200, mimeType: 'application/json' },
+    });
+    contents.debugger.emit('message', {}, 'Network.loadingFinished', {
+      requestId: 'deck',
+      encodedDataLength: 100,
+    });
+    await vi.waitFor(() => expect(oldLesson).toHaveBeenCalledTimes(1));
+    expect(newLesson).not.toHaveBeenCalled();
+  });
+
   it('streams actual PPT transfer stages and failures without deep capture', async () => {
     const collector = new BrowserLessonCollector();
     const stages: string[] = [];
@@ -298,8 +485,12 @@ class FakeDebugger extends EventEmitter {
 }
 
 class FakeContents {
-  readonly id = 1;
+  constructor(readonly id = 1) {}
   readonly debugger = new FakeDebugger();
+
+  getURL(): string {
+    return 'https://www.yuketang.cn/web';
+  }
 
   isDestroyed(): boolean {
     return false;

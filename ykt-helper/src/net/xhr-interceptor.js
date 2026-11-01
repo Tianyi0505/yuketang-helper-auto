@@ -298,3 +298,39 @@ export async function getActivePresentationId(lessonId) {
   console.warn('[雨课堂助手][WARN][getActivePresentationId] no pid found for lesson', lessonId);
   return null;
 }
+/**
+ * 主动拉取课件数据。
+ * 自动进入的课堂不会由站点自身发起 presentation/fetch 请求，
+ * 因此 XHR 拦截器拿不到数据，需要这里显式获取。
+ */
+export async function fetchPresentation(presentationId, opts = {}) {
+  if (!presentationId) return null;
+  const origin = location.origin;
+  const same = (p) => new URL(p, origin).toString();
+  const qs = `?presentation_id=${encodeURIComponent(presentationId)}`;
+  const candidates = [
+    same(`/api/v3/lesson/presentation/fetch${qs}`),
+    same(`/apiv3/lesson/presentation/fetch${qs}`),
+    same(`/mooc-api/v1/lms/lesson/presentation/fetch${qs}`),
+  ];
+
+  const headers = { xtbz: 'ykt' };
+  if (opts?.auth) headers.Authorization = `Bearer ${opts.auth}`;
+
+  for (const url of candidates) {
+    try {
+      const r = await fetch(url, { credentials: 'include', headers });
+      if (!r.ok) continue;
+      const j = await r.json().catch(() => null);
+      const data = j?.data || j?.result;
+      if (data && Array.isArray(data.slides)) {
+        console.log('[雨课堂助手][DBG][fetchPresentation] OK', { url, slides: data.slides.length });
+        return data;
+      }
+    } catch {
+      // 换下一个候选网关
+    }
+  }
+  console.warn('[雨课堂助手][WARN][fetchPresentation] 无法获取课件:', presentationId);
+  return null;
+}

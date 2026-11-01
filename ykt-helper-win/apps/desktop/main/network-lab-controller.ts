@@ -67,6 +67,7 @@ export class NetworkLabController {
     );
     this.#observers.set(contents.id, observer);
     contents.once('destroyed', () => {
+      observer.destroy();
       if (contents.id !== this.#sessionObserverId) {
         this.#observers.delete(contents.id);
       }

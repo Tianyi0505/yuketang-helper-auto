@@ -212,7 +212,7 @@ describe('M4 backend active client', () => {
     expect(socket.closed).toBe(true);
   });
 
-  it('retries submit after re-check-in when the server returns 50004', async () => {
+  it('retries submit once after re-check-in when the server returns HTTP 401', async () => {
     const credentialsSource = new DynamicCredentialsSource(
       'initial-token',
       'session=abc',
@@ -253,7 +253,7 @@ describe('M4 backend active client', () => {
           ],
         },
       }),
-      response({ code: 50004 }),
+      { ...response({ msg: 'Unauthorized' }), status: 401 },
       response(
         { data: { lessonToken: 'fresh-token' } },
         { 'Set-Auth': 'refreshed-token' },
@@ -292,7 +292,7 @@ describe('M4 backend active client', () => {
     });
     expect(result).toMatchObject({ problemId: '11', status: 'submitted' });
     expect(transport.requests).toHaveLength(6);
-    // First submit attempt (failed with 50004)
+    // First submit attempt is explicitly rejected as unauthenticated.
     expect(transport.requests[3]).toMatchObject({
       method: 'POST',
       url: 'https://www.yuketang.cn/api/v3/lesson/problem/answer',
@@ -347,7 +347,7 @@ describe('M4 backend active client', () => {
           ],
         },
       }),
-      response({ code: 50004 }),
+      { status: 401, headers: {}, body: { code: 401 } },
       { status: 400, headers: {}, body: { code: 400 } },
     ]);
     const socket = new FakeSocket();
@@ -383,7 +383,7 @@ describe('M4 backend active client', () => {
 
     await expect(
       runtime.facade.submitAnswer({ problemId: '11', answer: 'B' }),
-    ).rejects.toThrow(/code 50004.*HTTP 400/);
+    ).rejects.toThrow(/HTTP 401.*HTTP 400/);
     expect(await runtime.facade.listLogs()).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -394,8 +394,8 @@ describe('M4 backend active client', () => {
               failurePhase: 'lesson-token-refresh',
               environment: BrowserEnvironment.Standard,
               lessonId: '7',
-              submitError: 'Yuketang request failed with code 50004.',
-              refreshError: 'Yuketang request failed with HTTP 400.',
+              submitError: expect.stringContaining('HTTP 401'),
+              refreshError: expect.stringContaining('HTTP 400'),
               submissionRoute: 'answer',
               refreshOperation: 'checkin',
             }),
@@ -448,8 +448,8 @@ describe('M4 backend active client', () => {
           ],
         },
       }),
-      // First submit fails with 50004 (token expired)
-      response({ code: 50004 }),
+      // Only HTTP 401, not the lesson-ended code 50004, triggers refresh.
+      { ...response({ msg: 'Unauthorized' }), status: 401 },
       // Re-checkin returns fresh token
       response(
         { data: { lessonToken: 'fresh-token' } },
@@ -667,7 +667,7 @@ describe('M4 backend active client', () => {
     await runtime.stop();
   });
 
-  it('removes the previous browser collector when switching lessons', async () => {
+  it('attributes concurrent unknown-deck responses only to their classroom page', async () => {
     const transport = new QueueTransport([
       response({
         data: {
@@ -696,7 +696,7 @@ describe('M4 backend active client', () => {
     await runtime.facade.refreshLessons(BrowserEnvironment.Standard);
     await runtime.facade.connectLesson(BrowserEnvironment.Standard, '7');
     await runtime.facade.connectLesson(BrowserEnvironment.Standard, '8');
-    await collector.observeHttp({
+    const deckResponse = {
       url: 'https://www.yuketang.cn/api/v3/lesson/presentation/fetch?presentation_id=99',
       statusCode: 200,
       body: JSON.stringify({
@@ -706,6 +706,14 @@ describe('M4 backend active client', () => {
           slides: [{ id: 100, index: 1 }],
         },
       }),
+    };
+    // Neither unknown deck may be guessed from an unscoped response.
+    await collector.observeHttp(deckResponse);
+    expect(await runtime.facade.listPresentations('7')).toEqual([]);
+    expect(await runtime.facade.listPresentations('8')).toEqual([]);
+    await collector.observeHttp({
+      ...deckResponse,
+      pageUrl: 'https://www.yuketang.cn/lesson/fullscreen/v3/8/ppt/1',
     });
 
     expect(await runtime.facade.listPresentations('7')).toEqual([]);
@@ -855,7 +863,7 @@ describe('M4 backend active client', () => {
     expect(await runtime.facade.listProblems(reset.lessonId)).toContainEqual(
       expect.objectContaining({
         id: 'simulation-problem-scalar',
-        status: 'available',
+        status: 'expired',
       }),
     );
     expect(notices.map((notice) => notice.kind)).toEqual([

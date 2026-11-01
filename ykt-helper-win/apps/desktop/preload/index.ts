@@ -9,6 +9,7 @@ import {
   type AnswerInput,
   type AnswerProposal,
   type AppLogEntry,
+  type AutomationLogInput,
   type AppSettings,
   type BrowserEnvironment,
   type BrowserState,
@@ -44,6 +45,8 @@ import {
 } from '@ykt/contracts';
 
 const api: DesktopApi = Object.freeze({
+  logAutomation: (input: AutomationLogInput) =>
+    ipcRenderer.invoke(IpcChannel.LogAutomation, input) as Promise<void>,
   getRuntimeStatus: () =>
     ipcRenderer.invoke(IpcChannel.GetRuntimeStatus) as Promise<RuntimeStatus>,
   getSettings: () =>

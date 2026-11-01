@@ -50,6 +50,8 @@ export const repo = {
   autoJoinRunning: false,           // 轮询开关
   autoJoinedLessons: new Set(),     // 被“自动进入”的课堂集合（仅标记自动进入建立的连接）
   forceAutoAnswerLessons: new Set(),// 若需要，可以对某些课强制视为“自动答题开启”
+  pendingUnlocks: new Map(),        // problemId -> 解锁事件；课件尚未抵达时暂存，待课件载入后重放
+  lessonPresentationLoading: new Set(), // lessonId 集合，避免并发重复拉取课件
 
   // 载入本课（按课程分组）在本地存储过的课件
   loadStoredPresentations() {

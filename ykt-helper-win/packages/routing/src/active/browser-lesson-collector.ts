@@ -6,7 +6,7 @@ import {
   type Slide,
 } from '@ykt/contracts';
 
-import { hostAdapterFor } from './host-adapter.js';
+import { hostAdapterFor, normalizeTimestamp } from './host-adapter.js';
 
 export type BrowserLessonObservation =
   | { type: 'presentation'; presentation: Presentation }
@@ -21,6 +21,7 @@ export interface ObservedBrowserHttpResponse {
   requestBody?: string | null;
   contextId?: string;
   resourceType?: string;
+  pageUrl?: string;
 }
 
 export interface BrowserArchivedPresentationObservation {
@@ -28,10 +29,12 @@ export interface BrowserArchivedPresentationObservation {
   lessonId: string;
   lessonTitle: string;
   presentation: Presentation;
+  problemStarts?: Readonly<Record<string, number>>;
 }
 
 export interface ObservedBrowserWebSocketFrame {
   requestId: string;
+  contextId?: string;
   direction: 'sent' | 'received' | 'closed';
   payload: string | null;
 }
@@ -51,6 +54,7 @@ interface ArchivedReportState {
   lessonTitle: string;
   titlePriority: number;
   slides: Map<string, Slide>;
+  problemStarts: Record<string, number>;
   emitTimer: ReturnType<typeof setTimeout> | null;
 }
 
@@ -64,6 +68,7 @@ export class BrowserLessonCollector {
   >();
   readonly #lessons = new Map<string, LessonWatch>();
   readonly #socketLessons = new Map<string, string>();
+  readonly #contextLessons = new Map<string, string>();
   readonly #archivedReports = new Map<string, ArchivedReportState>();
   readonly #archivedListeners = new Set<
     (
@@ -103,6 +108,7 @@ export class BrowserLessonCollector {
       | 'format-error';
     receivedBytes?: number;
     detail?: string;
+    pageUrl?: string | undefined;
   }): void {
     const url = safeUrl(input.url);
     if (!url || !isCollectionResponse(url.pathname)) return;
@@ -120,7 +126,7 @@ export class BrowserLessonCollector {
           environment,
           url.searchParams.get('presentation_id') ??
             url.searchParams.get('presentationId'),
-          true,
+          input.pageUrl,
         );
     if (!match || match[1].environment !== environment) return;
     const [lessonId, watch] = match;
@@ -154,6 +160,12 @@ export class BrowserLessonCollector {
     presentationId: string | null,
     listener: LessonWatch['listener'],
   ): void {
+    const existing = this.#lessons.get(lessonId);
+    if (existing?.environment === environment) {
+      existing.listener = listener;
+      existing.presentationId = presentationId ?? existing.presentationId;
+      return;
+    }
     this.#lessons.set(lessonId, {
       status: {
         lessonId,
@@ -180,21 +192,43 @@ export class BrowserLessonCollector {
     for (const [requestId, mappedLessonId] of this.#socketLessons) {
       if (mappedLessonId === lessonId) this.#socketLessons.delete(requestId);
     }
+    for (const [contextId, mappedLessonId] of this.#contextLessons) {
+      if (mappedLessonId === lessonId) this.#contextLessons.delete(contextId);
+    }
   }
 
   clear(): void {
     this.#lessons.clear();
     this.#socketLessons.clear();
+    this.#contextLessons.clear();
     for (const report of this.#archivedReports.values()) {
       if (report.emitTimer) clearTimeout(report.emitTimer);
     }
     this.#archivedReports.clear();
   }
 
+  releaseContext(contextId: string): void {
+    for (const key of this.#socketLessons.keys()) {
+      if (key.startsWith(`${contextId}:`)) this.#socketLessons.delete(key);
+    }
+    const lessonId = this.#contextLessons.get(contextId);
+    this.#contextLessons.delete(contextId);
+    // A closed classroom tab cannot deliver events for its lesson anymore.
+    // Drop the watch so another lesson's presentation is not matched against
+    // a stale listener with an unknown deck ID.
+    if (lessonId && ![...this.#contextLessons.values()].includes(lessonId)) {
+      this.unwatchLesson(lessonId);
+    }
+    const report = this.#archivedReports.get(contextId);
+    if (report?.emitTimer) clearTimeout(report.emitTimer);
+    this.#archivedReports.delete(contextId);
+  }
+
   async observeHttp(input: ObservedBrowserHttpResponse): Promise<void> {
     if (input.statusCode < 200 || input.statusCode >= 300) {
       this.observeCollectionRequest({
         url: input.url,
+        pageUrl: input.pageUrl,
         phase: 'network-error',
         detail: `HTTP ${input.statusCode}`,
       });
@@ -225,7 +259,11 @@ export class BrowserLessonCollector {
       url.searchParams.get('presentation_id') ??
       url.searchParams.get('presentationId') ??
       presentationIdFromResponse(value);
-    const match = this.findLesson(environment, responsePresentationId);
+    const match = this.findLesson(
+      environment,
+      responsePresentationId,
+      input.pageUrl,
+    );
     if (!match) return;
 
     const [lessonId, watch] = match;
@@ -305,8 +343,9 @@ export class BrowserLessonCollector {
   }
 
   async observeWebSocket(input: ObservedBrowserWebSocketFrame): Promise<void> {
+    const socketKey = `${input.contextId ?? ''}:${input.requestId}`;
     if (input.direction === 'closed') {
-      this.#socketLessons.delete(input.requestId);
+      this.#socketLessons.delete(socketKey);
       return;
     }
     const message = parseJson(input.payload ?? '');
@@ -314,13 +353,18 @@ export class BrowserLessonCollector {
 
     if (input.direction === 'sent') {
       const lessonId = helloLessonId(message);
-      if (lessonId && this.#lessons.has(lessonId)) {
-        this.#socketLessons.set(input.requestId, lessonId);
+      // The official tab can establish its socket before the next auto-join
+      // poll registers a watch. Keep the hello binding for subsequent frames.
+      if (lessonId) {
+        this.#socketLessons.set(socketKey, lessonId);
+        if (input.contextId) {
+          this.#contextLessons.set(input.contextId, lessonId);
+        }
       }
       return;
     }
 
-    const lessonId = this.#socketLessons.get(input.requestId);
+    const lessonId = this.#socketLessons.get(socketKey);
     if (!lessonId) return;
     const watch = this.#lessons.get(lessonId);
     if (!watch) return;
@@ -333,23 +377,29 @@ export class BrowserLessonCollector {
   private findLesson(
     environment: BrowserEnvironment,
     presentationId: string | null,
-    strictPresentationId = false,
+    pageUrl?: string,
   ): [string, LessonWatch] | null {
     const candidates = [...this.#lessons.entries()].filter(
       ([, watch]) => watch.environment === environment,
     );
+    const page = pageUrl ? safeUrl(pageUrl) : null;
+    if (page) {
+      if (environmentForHostname(page.hostname) !== environment) return null;
+      // The official classroom can switch decks during a lesson. Bind that
+      // response to its own page, never to a lesson in another browser tab.
+      const lessonId = /^\/lesson\/fullscreen\/v3\/([^/]+)(?:\/|$)/.exec(
+        page.pathname,
+      )?.[1];
+      if (lessonId) return candidates.find(([id]) => id === lessonId) ?? null;
+      if (page.pathname.includes('/student-lesson-report/')) return null;
+    }
     if (presentationId) {
-      const exact = candidates.find(
+      const exact = candidates.filter(
         ([, watch]) => watch.presentationId === presentationId,
       );
-      if (exact) return exact;
-      // Request-only diagnostics lack a body to bind a changed presentation.
-      // Preserve the existing response fallback for teachers switching decks.
-      if (
-        strictPresentationId &&
-        candidates.some(([, watch]) => watch.presentationId)
-      )
-        return null;
+      // A different or ambiguous deck cannot be attributed to the sole watch
+      // just because a separate browser tab loaded it.
+      return exact.length === 1 ? exact[0]! : null;
     }
     return candidates.length === 1 ? candidates[0]! : null;
   }
@@ -363,7 +413,11 @@ export class BrowserLessonCollector {
     if (!environment || !lessonId) return;
     const contextId = input.contextId ?? `${environment}:${lessonId}`;
     let report = this.#archivedReports.get(contextId);
-    if (!report || report.lessonId !== lessonId) {
+    if (
+      !report ||
+      report.lessonId !== lessonId ||
+      report.environment !== environment
+    ) {
       if (report?.emitTimer) clearTimeout(report.emitTimer);
       report = {
         environment,
@@ -371,6 +425,7 @@ export class BrowserLessonCollector {
         lessonTitle: '',
         titlePriority: -1,
         slides: new Map(),
+        problemStarts: {},
         emitTimer: null,
       };
       this.#archivedReports.set(contextId, report);
@@ -408,8 +463,72 @@ export class BrowserLessonCollector {
     }
     for (const candidate of reportSlides(value, lessonId, environment)) {
       if (candidate.imageUrl) {
-        report.slides.set(normalizeResourceUrl(candidate.imageUrl), candidate);
+        const key = normalizeResourceUrl(candidate.imageUrl);
+        if (!report.slides.get(key)?.problem) report.slides.set(key, candidate);
       }
+    }
+    const data = record(record(value)?.data);
+    // These are the two official review entry points, not all problems in the
+    // courseware. A deck can contain exercises the teacher never published.
+    const review = Array.isArray(data?.timelineList) ? data.timelineList : [];
+    const detail = record(data?.problem)?.studentList;
+    const published = [
+      ...review.flatMap((item) => {
+        const slide = record(item);
+        return slide?.hasProblem === true &&
+          slide.sendProblem === true &&
+          slide.visible !== false &&
+          record(slide.problem)
+          ? [{ ...record(slide.problem)!, cover: slide.cover }]
+          : [];
+      }),
+      ...(Array.isArray(detail) ? detail : []),
+    ];
+    for (const raw of published) {
+      const problem = record(raw);
+      const id = stringId(problem?.problemId);
+      const cover = typeof problem?.cover === 'string' ? problem.cover : null;
+      if (!problem || !id || !cover) continue;
+      const url = safeUrl(cover);
+      if (!url) continue;
+      const coverKey = normalizeResourceUrl(cover);
+      // Reuse a cover admitted by the structured report-slide validator (which
+      // also supports extensionless official slides), never an arbitrary URL.
+      if (!isSlideImageResponse(url) && !report.slides.has(coverKey)) continue;
+      const parsed = hostAdapterFor(environment).parsePresentation(
+        {
+          data: {
+            slides: [
+              {
+                id,
+                index: Math.max(0, (numberValue(problem.idx) ?? 1) - 1),
+                cover,
+                problem,
+              },
+            ],
+          },
+        },
+        lessonId,
+        `report-${lessonId}`,
+      ).slides[0]!;
+      if (!parsed.problem) continue;
+      const answer = parsed.problem.result;
+      parsed.problem = {
+        ...parsed.problem,
+        source: 'classroom-report',
+        result:
+          problem.isAnswered === false ||
+          problem.answered === false ||
+          (Array.isArray(answer) &&
+            answer.length === 0 &&
+            problem.isAnswered !== true &&
+            problem.answered !== true)
+            ? null
+            : answer,
+      };
+      report.slides.set(coverKey, parsed);
+      const start = normalizeTimestamp(problem.send_time);
+      if (start !== null && start > 0) report.problemStarts[id] = start;
     }
     // Metadata alone discovers a lesson; lazy or cached images need not emit
     // any new Image response at all.
@@ -427,6 +546,20 @@ export class BrowserLessonCollector {
         ? [...this.#archivedReports.values()][0]
         : undefined;
     if (!report) return;
+    if (input.pageUrl) {
+      const page = safeUrl(input.pageUrl);
+      const pageLessonId = page
+        ? /^\/v2\/web\/student-lesson-report\/[^/]+\/([^/]+)(?:\/|$)/.exec(
+            page.pathname,
+          )?.[1]
+        : null;
+      if (
+        !page ||
+        environmentForHostname(page.hostname) !== report.environment ||
+        pageLessonId !== report.lessonId
+      )
+        return;
+    }
     const imageUrl = url.toString();
     const key = normalizeResourceUrl(imageUrl);
     if (report.slides.has(key)) return;
@@ -458,26 +591,29 @@ export class BrowserLessonCollector {
       ),
     };
     const watch = this.#lessons.get(report.lessonId);
-    if (presentation.slides.length > 0)
-      this.updateStatus(report.lessonId, {
-        phase: 'ready',
-        slideCount: presentation.slides.length,
-        problemCount: presentation.slides.filter((slide) => slide.problem)
-          .length,
-        detail: '',
-      });
-    if (
-      this.#archivedListeners.size === 0 &&
-      watch?.environment === report.environment
-    ) {
-      await watch.listener({ type: 'presentation', presentation });
-      return;
+    if (watch?.environment === report.environment) {
+      for (const slide of presentation.slides) {
+        if (slide.problem) watch.problemIds.add(slide.problem.id);
+      }
+      if (presentation.slides.length > 0)
+        this.updateStatus(report.lessonId, {
+          phase: 'ready',
+          slideCount: presentation.slides.length,
+          problemCount: presentation.slides.filter((slide) => slide.problem)
+            .length,
+          detail: '',
+        });
+      if (this.#archivedListeners.size === 0) {
+        await watch.listener({ type: 'presentation', presentation });
+        return;
+      }
     }
     const observation: BrowserArchivedPresentationObservation = {
       environment: report.environment,
       lessonId: report.lessonId,
       lessonTitle: report.lessonTitle,
       presentation,
+      problemStarts: { ...report.problemStarts },
     };
     for (const listener of this.#archivedListeners) await listener(observation);
   }
@@ -602,6 +738,7 @@ function reportLessonTitle(value: unknown): string {
       data?.lessonName ??
       data?.lesson_title ??
       data?.lesson_name ??
+      data?.lessonName ??
       data?.title,
   );
   const course = stringValue(

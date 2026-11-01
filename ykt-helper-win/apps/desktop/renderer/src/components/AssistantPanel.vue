@@ -15,6 +15,7 @@ import {
   type AnswerValue,
   type AppLogEntry,
   type AppSettings,
+  type AutomationLogInput,
   type BrowserEnvironment,
   type ClassroomNotice,
   type ClassroomNoticeKind,
@@ -157,6 +158,44 @@ const emit = defineEmits<{
 const user = ref<UserProfile | null>(null);
 const lessons = ref<readonly Lesson[]>([]);
 const selectedLessonId = ref('');
+const browserReportLessonId = computed(() => {
+  try {
+    const url = new URL(props.browserUrl ?? '');
+    if (
+      ![
+        'www.yuketang.cn',
+        'pro.yuketang.cn',
+        'changjiang.yuketang.cn',
+      ].includes(url.hostname)
+    )
+      return '';
+    return (
+      /^\/v2\/web\/student-lesson-report\/[^/]+\/([^/]+)(?:\/|$)/.exec(
+        url.pathname,
+      )?.[1] ?? ''
+    );
+  } catch {
+    return '';
+  }
+});
+const browserLiveLessonId = computed(() => {
+  try {
+    const url = new URL(props.browserUrl ?? '');
+    if (
+      ![
+        'www.yuketang.cn',
+        'pro.yuketang.cn',
+        'changjiang.yuketang.cn',
+      ].includes(url.hostname)
+    )
+      return '';
+    return (
+      /^\/lesson\/fullscreen\/v3\/([^/]+)(?:\/|$)/.exec(url.pathname)?.[1] ?? ''
+    );
+  } catch {
+    return '';
+  }
+});
 const problems = ref<readonly ProblemContext[]>([]);
 const selectedProblemId = ref('');
 const answerDrafts = new Map<string, { draft: string; proposalId: string }>();
@@ -301,7 +340,10 @@ const infoMessage = ref('');
 const subscriptions: Array<() => void> = [];
 const connectedLessonIds = new Set<string>();
 const seenAvailableProblems = new Set<string>();
-const scheduledProblems = new Map<string, ReturnType<typeof setTimeout>>();
+const scheduledProblems = new Map<
+  string,
+  { timer: ReturnType<typeof setTimeout>; lessonId: string; report: boolean }
+>();
 const automaticSubmissions = new Set<string>();
 const slideSelectionTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let automationTimer: ReturnType<typeof setInterval> | undefined;
@@ -329,6 +371,12 @@ const selectedLessonLabel = computed(() =>
 const selectedProblem = computed(() =>
   problems.value.find((problem) => problem.id === selectedProblemId.value),
 );
+const selectedProblemImage = computed(() => {
+  const problem = selectedProblem.value;
+  return presentations.value
+    .find((item) => item.id === problem?.presentationId)
+    ?.slides.find((slide) => slide.id === problem?.slideId)?.imageUrl;
+});
 
 const selectedPresentation = computed(() =>
   presentations.value.find(
@@ -522,7 +570,7 @@ onMounted(async () => {
 onUnmounted(() => {
   subscriptions.forEach((unsubscribe) => unsubscribe());
   if (automationTimer) clearInterval(automationTimer);
-  for (const timer of scheduledProblems.values()) clearTimeout(timer);
+  for (const { timer } of scheduledProblems.values()) clearTimeout(timer);
   for (const timer of slideSelectionTimers.values()) clearTimeout(timer);
 });
 
@@ -551,6 +599,19 @@ watch([() => props.environment, selectedLessonId, selectedProblemId], () => {
   if (selectedProblemId.value) aiSlideContextId.value = '';
   resetAnswer();
 });
+watch(
+  () => browserReportLessonId.value || browserLiveLessonId.value,
+  (id) => {
+    if (!id) return;
+    // Clear the previous classroom synchronously, including while the new
+    // classroom's network responses are still in flight.
+    selectedLessonId.value = id;
+    selectedProblemId.value = '';
+    problems.value = [];
+    presentations.value = [];
+    void syncBrowserReport().catch(() => {});
+  },
+);
 watch(
   () => props.page,
   (page) => {
@@ -615,7 +676,9 @@ async function loadWorkspace(): Promise<void> {
   else failed.push('用户信息');
   if (lessonResult.status === 'fulfilled') {
     lessons.value = lessonResult.value;
-    if (!selectedLessonId.value) {
+    if (browserReportLessonId.value) {
+      selectedLessonId.value = browserReportLessonId.value;
+    } else if (!selectedLessonId.value) {
       selectedLessonId.value = chooseClassroom(
         lessonResult.value,
         props.browserUrl,
@@ -676,15 +739,13 @@ async function refreshClassroom(): Promise<void> {
 }
 
 async function connectLesson(): Promise<void> {
-  if (!selectedLessonId.value) return;
+  const lessonId = selectedLessonId.value;
+  const environment = props.environment;
+  if (!lessonId) return;
   await run('connect', async () => {
-    await window.yuketang.connectLesson(
-      props.environment,
-      selectedLessonId.value,
-    );
-    connectedLessonIds.clear();
-    connectedLessonIds.add(selectedLessonId.value);
-    collectingLessonId.value = selectedLessonId.value;
+    await window.yuketang.connectLesson(environment, lessonId);
+    connectedLessonIds.add(lessonId);
+    collectingLessonId.value = lessonId;
     infoMessage.value = '已打开官方课堂，正在收集题目与课件';
     await loadLessonData();
   });
@@ -736,7 +797,18 @@ async function loadLessonData(): Promise<void> {
     presentationResult.status === 'rejected'
   )
     errorMessage.value = '部分课堂数据同步失败，请刷新重试。';
-  const nextProblems = problems.value;
+  const reportProblems = problems.value
+    .filter((problem) => problem.source === 'classroom-report')
+    .sort((a, b) => (a.unlockedAt ?? 0) - (b.unlockedAt ?? 0));
+  const lessonEnded =
+    lessons.value.find((lesson) => lesson.id === lessonId)?.status === 'ended';
+  // A finished classroom's official review is authoritative when available.
+  const nextProblems =
+    (browserReportLessonId.value === lessonId || lessonEnded) &&
+    reportProblems.length > 0
+      ? reportProblems
+      : problems.value;
+  if (nextProblems !== problems.value) problems.value = nextProblems;
   const nextPresentations = presentations.value;
   if (!nextProblems.some((problem) => problem.id === selectedProblemId.value)) {
     selectedProblemId.value =
@@ -772,6 +844,41 @@ function markSubmittedProblem(
     item.id === problem.id
       ? { ...item, status: 'answered', result: answer ?? item.result }
       : item,
+  );
+}
+
+async function syncBrowserReport(): Promise<void> {
+  const lessonId = browserReportLessonId.value || browserLiveLessonId.value;
+  if (!lessonId) return;
+  const nextLessons = await window.yuketang.listLessons();
+  if ((browserReportLessonId.value || browserLiveLessonId.value) !== lessonId)
+    return;
+  lessons.value = nextLessons;
+  selectedLessonId.value = lessonId;
+  await loadLessonData();
+}
+
+function canAutomaticallyAnswer(problem: ProblemContext): boolean {
+  if (problem.source === 'classroom-report') {
+    const onReviewPage = browserReportLessonId.value === problem.lessonId;
+    const lesson = lessons.value.find((item) => item.id === problem.lessonId);
+    const lessonActive = lesson?.status === 'active';
+    const lessonEnded = lesson?.status === 'ended';
+    const selected = selectedLessonId.value === problem.lessonId;
+    if (problem.unlockedAt === null) return false;
+    if (problem.status === 'available') return onReviewPage || lessonActive;
+    // Closed review exercises can be submitted through the retry endpoint.
+    // Do it while their review is open, or while the panel shows that ended
+    // classroom, so an unrelated old classroom is never touched.
+    return (
+      problem.status === 'expired' &&
+      (onReviewPage || (selected && lessonEnded))
+    );
+  }
+  return (
+    problem.status === 'available' &&
+    lessons.value.find((lesson) => lesson.id === problem.lessonId)?.status !==
+      'ended'
   );
 }
 
@@ -1076,8 +1183,10 @@ async function requestAiProposal(
   prompt: string,
   auto: boolean,
   retry: boolean,
+  automaticImageUrls?: readonly string[],
 ): Promise<void> {
   const environment = props.environment;
+  const background = auto && automaticImageUrls !== undefined;
   const managedSubmitAtStart = agentAutoSubmitEnabled.value;
   clearMessages();
   let session = aiChatSessions.get(contextId);
@@ -1086,10 +1195,15 @@ async function requestAiProposal(
       id: crypto.randomUUID(),
       contextId,
       ...(problem ? { problemId: problem.id } : {}),
-      imageUrls: problem
-        ? problemImageUrls(problem)
-        : [...selectedAiImages.value],
-      captureCurrentPage: captureCurrentBrowserPage.value,
+      imageUrls: auto
+        ? [
+            ...(automaticImageUrls ??
+              (problem ? problemImageUrls(problem) : [])),
+          ]
+        : problem
+          ? problemImageUrls(problem)
+          : [...selectedAiImages.value],
+      captureCurrentPage: !auto && captureCurrentBrowserPage.value,
       messages: [],
       requestVersion: 0,
       lastPrompt: prompt,
@@ -1123,10 +1237,10 @@ async function requestAiProposal(
     status: 'pending',
   });
   const pendingMessage = session.messages[session.messages.length - 1]!;
-  aiProposal.value = undefined;
+  if (currentAiContextId.value === contextId) aiProposal.value = undefined;
 
   if (auto && problem) {
-    void emitLocalNotice(
+    await emitLocalNotice(
       'auto-answer-started',
       problem,
       'Agent 开始作答',
@@ -1137,11 +1251,13 @@ async function requestAiProposal(
   try {
     const includeInitialContext =
       Boolean(problem) || retry || session.messages.length === 2;
-    const imageUrls = problem
-      ? problemImageUrls(problem)
-      : includeInitialContext
-        ? [...session.imageUrls]
-        : [];
+    const imageUrls = auto
+      ? [...(automaticImageUrls ?? session.imageUrls)]
+      : problem
+        ? problemImageUrls(problem)
+        : includeInitialContext
+          ? [...session.imageUrls]
+          : [];
     proposal = await window.yuketang.generateAnswerProposal({
       ...(session.problemId
         ? { problemId: session.problemId }
@@ -1149,7 +1265,10 @@ async function requestAiProposal(
       imageUrls,
       ...(imageUrls.length ? { imageSource: 'slide' as const } : {}),
       captureCurrentPage:
-        !problem && includeInitialContext && session.captureCurrentPage,
+        !auto &&
+        !problem &&
+        includeInitialContext &&
+        session.captureCurrentPage,
       customPrompt: prompt,
       sessionId: session.id,
       retry,
@@ -1195,9 +1314,10 @@ async function requestAiProposal(
   if (!problem) return;
   if (
     environment !== props.environment ||
-    selectedLessonId.value !== problem.lessonId
+    (!background && selectedLessonId.value !== problem.lessonId)
   )
     return;
+  if (proposal.status === 'ready') await logAutomation(problem, 'generated');
   if (managedSubmitAtStart && agentAutoSubmitEnabled.value) {
     try {
       await applyAutomaticProposal(problem, proposal);
@@ -1274,26 +1394,56 @@ async function applyAutomaticProposal(
   )
     return;
 
-  if (selectedProblemId.value === problem.id) {
-    answerDraft.value = answerValueToDraft(proposal.answer, problem.type);
-    appliedProposalId.value = proposal.id;
-  }
-
   if (!agentAutoSubmitEnabled.value) {
     infoMessage.value = 'LLM 已生成答案，托管提交已关闭。';
+    await logAutomation(problem, 'skipped', 'managed-submit-disabled');
     return;
   }
-  const current = problems.value.find((item) => item.id === problem.id);
-  const submissionKey = `${props.environment}:${problem.lessonId}:${problem.id}`;
+  const submissionKey = `${environment}:${problem.lessonId}:${problem.id}`;
+  if (automaticSubmissions.has(submissionKey)) return;
   if (
-    !current ||
-    current.lessonId !== selectedLessonId.value ||
-    current.status === 'answered' ||
-    automaticSubmissions.has(submissionKey)
+    selectedLessonId.value === problem.lessonId &&
+    problems.value.find((item) => item.id === problem.id)?.status === 'answered'
   )
     return;
+  const current = (await window.yuketang.listProblems(problem.lessonId)).find(
+    (item) => item.id === problem.id,
+  );
+  const currentLesson = (await window.yuketang.listLessons()).find(
+    (lesson) => lesson.id === problem.lessonId,
+  );
+  // An in-flight live answer can use the official retry route after its
+  // deadline, but must have been available when generation started.
+  const liveRetry =
+    problem.status === 'available' &&
+    current?.status === 'expired' &&
+    current.unlockedAt !== null &&
+    currentLesson?.status === 'active';
+  const eligible =
+    current?.source === 'classroom-report'
+      ? canAutomaticallyAnswer(current)
+      : currentLesson?.status !== 'ended' &&
+        ((current?.status === 'available' &&
+          (!current.deadlineAt || current.deadlineAt > Date.now())) ||
+          liveRetry);
+  if (
+    environment !== props.environment ||
+    !agentAutoSubmitEnabled.value ||
+    current?.lessonId !== problem.lessonId ||
+    !eligible ||
+    automaticSubmissions.has(submissionKey)
+  ) {
+    if (
+      problem.source === 'classroom-report' &&
+      browserReportLessonId.value !== problem.lessonId
+    )
+      seenAvailableProblems.delete(problem.id);
+    await logAutomation(problem, 'skipped', 'problem-no-longer-eligible');
+    return;
+  }
   automaticSubmissions.add(submissionKey);
   try {
+    await logAutomation(problem, 'submit-started');
     const result = await window.yuketang.submitAnswer({
       problemId: problem.id,
       answer: proposal.answer,
@@ -1302,25 +1452,31 @@ async function applyAutomaticProposal(
     });
     if (result.status !== 'submitted')
       throw new Error('服务端未确认答案提交成功。');
-    if (
-      environment !== props.environment ||
-      selectedLessonId.value !== problem.lessonId
-    )
-      return;
-    markSubmittedProblem(problem, proposal.answer);
-    if (selectedProblemId.value === problem.id) {
-      appliedProposalId.value = '';
-      confirmed.value = false;
-      submissionMessage.value = `Agent 已于 ${formatTime(result.submittedAt)} 自动提交`;
+    await logAutomation(problem, 'submitted');
+    if (environment === props.environment) {
+      if (selectedLessonId.value === problem.lessonId) {
+        markSubmittedProblem(problem, proposal.answer);
+        if (selectedProblemId.value === problem.id) {
+          if (!answerDraft.value.trim() && !confirmed.value)
+            answerDraft.value = answerValueToDraft(
+              proposal.answer,
+              problem.type,
+            );
+          appliedProposalId.value = '';
+          confirmed.value = false;
+          submissionMessage.value = `Agent 已于 ${formatTime(result.submittedAt)} 自动提交`;
+        }
+        infoMessage.value = 'Agent 已自动确认并提交答案';
+        // A display refresh failure must not turn a successful submission into a failure.
+        await loadLessonData().catch(() => {});
+      }
+      await emitLocalNotice(
+        'auto-answer-succeeded',
+        problem,
+        'Agent 已提交答案',
+        `${problemTypeLabel(problem.type)}已由模型完成并提交。`,
+      );
     }
-    infoMessage.value = 'Agent 已自动确认并提交答案';
-    await loadLessonData();
-    await emitLocalNotice(
-      'auto-answer-succeeded',
-      problem,
-      'Agent 已提交答案',
-      `${problemTypeLabel(problem.type)}已由模型完成并提交。`,
-    );
   } finally {
     automaticSubmissions.delete(submissionKey);
   }
@@ -1430,13 +1586,10 @@ async function saveSettings(): Promise<void> {
     infoMessage.value = '设置已保存';
   });
   if (!settings.value?.llmAutoGenerate) {
-    for (const timer of scheduledProblems.values()) clearTimeout(timer);
+    for (const { timer } of scheduledProblems.values()) clearTimeout(timer);
     scheduledProblems.clear();
   } else if (!wasAutoGenerateEnabled) {
-    for (const problem of problems.value) {
-      if (problem.status === 'available')
-        seenAvailableProblems.delete(problem.id);
-    }
+    seenAvailableProblems.clear();
     void automationTick();
   }
 }
@@ -1646,6 +1799,12 @@ async function testNotification(): Promise<void> {
 }
 
 async function handleClassroomNotice(notice: ClassroomNotice): Promise<void> {
+  if (notice.kind === 'lesson-finished') {
+    retireLessonAutomation(notice.lessonId);
+    lessons.value = lessons.value.map((lesson) =>
+      lesson.id === notice.lessonId ? { ...lesson, status: 'ended' } : lesson,
+    );
+  }
   const currentSettings = settings.value;
   if (!currentSettings?.notifyProblems || !noticeEnabled(notice.kind)) return;
   const previous = seenNotices.get(notice.dedupeKey);
@@ -1660,6 +1819,13 @@ async function emitLocalNotice(
   title: string,
   detail: string,
 ): Promise<void> {
+  if (kind === 'auto-answer-started' || kind === 'auto-answer-failed') {
+    await logAutomation(
+      problem,
+      kind === 'auto-answer-started' ? 'started' : 'failed',
+      kind === 'auto-answer-failed' ? detail : '',
+    );
+  }
   await handleClassroomNotice({
     kind,
     lessonId: problem.lessonId,
@@ -1668,6 +1834,29 @@ async function emitLocalNotice(
     detail,
     occurredAt: Date.now(),
   });
+}
+
+async function logAutomation(
+  problem: ProblemContext,
+  stage: AutomationLogInput['stage'],
+  reason = '',
+  delayMs: number | null = null,
+): Promise<void> {
+  try {
+    await window.yuketang.logAutomation({
+      stage,
+      lessonId: problem.lessonId,
+      problemId: problem.id,
+      deadlineAt: problem.deadlineAt,
+      remainingMs:
+        problem.deadlineAt === null ? null : problem.deadlineAt - Date.now(),
+      delayMs,
+      managedSubmit: agentAutoSubmitEnabled.value,
+      reason: reason.slice(0, 2048),
+    });
+  } catch {
+    // Logging failures must not interrupt automatic answers.
+  }
 }
 
 async function deliverNotice(notice: ClassroomNotice): Promise<void> {
@@ -1835,43 +2024,77 @@ async function automationTick(): Promise<void> {
   automationRunning = true;
   try {
     const now = Date.now();
+    await syncBrowserReport();
+    lessons.value = await window.yuketang.listLessons();
+    for (const lesson of lessons.value) {
+      if (lesson.status === 'ended') retireLessonAutomation(lesson.id);
+    }
     if (currentSettings.autoJoinEnabled && now - lastAutoJoinAt >= 5000) {
       lastAutoJoinAt = now;
       const refreshedLessons = await window.yuketang.refreshLessons(
         props.environment,
       );
       lessons.value = await window.yuketang.listLessons();
+      for (const lesson of lessons.value) {
+        if (lesson.status === 'ended') retireLessonAutomation(lesson.id);
+      }
       const enteredLessonIds = await enterActiveLessons(
         refreshedLessons,
         connectedLessonIds,
         (lessonId) =>
           window.yuketang.connectLesson(props.environment, lessonId),
       );
-      if (!selectedLessonId.value && enteredLessonIds[0]) {
+      if (
+        !browserReportLessonId.value &&
+        !browserLiveLessonId.value &&
+        (!selectedLessonId.value || selectedLesson.value?.status === 'ended') &&
+        enteredLessonIds[0]
+      ) {
         selectedLessonId.value = enteredLessonIds[0];
       }
     }
-    if (
-      !selectedLessonId.value ||
-      !connectedLessonIds.has(selectedLessonId.value)
-    )
-      return;
-    await loadLessonData();
-    const nextProblems = problems.value;
-    for (const problem of nextProblems) {
-      if (
-        problem.status !== 'available' ||
-        seenAvailableProblems.has(problem.id) ||
-        !currentSettings.llmAutoGenerate
-      )
-        continue;
-      seenAvailableProblems.add(problem.id);
-      await onAvailableProblem(problem);
+    const automationLessons = new Set(connectedLessonIds);
+    if (browserReportLessonId.value)
+      automationLessons.add(browserReportLessonId.value);
+    // Review exercises of the classroom currently shown in the panel remain
+    // eligible after the classroom ended; other ended classrooms do not.
+    if (selectedLessonId.value && selectedLesson.value?.status === 'ended') {
+      automationLessons.add(selectedLessonId.value);
+    }
+    for (const lessonId of automationLessons) {
+      try {
+        const nextProblems = await window.yuketang.listProblems(lessonId);
+        for (const problem of nextProblems) {
+          if (
+            !canAutomaticallyAnswer(problem) ||
+            seenAvailableProblems.has(problem.id) ||
+            !currentSettings.llmAutoGenerate
+          )
+            continue;
+          seenAvailableProblems.add(problem.id);
+          await onAvailableProblem(problem);
+        }
+      } catch {
+        // One unavailable lesson must not block the other connected lessons.
+      }
+    }
+    if (connectedLessonIds.has(selectedLessonId.value)) {
+      await loadLessonData();
     }
   } catch {
     // Background polling is reflected by the next explicit refresh or diagnostic log.
   } finally {
     automationRunning = false;
+  }
+}
+
+function retireLessonAutomation(lessonId: string): void {
+  connectedLessonIds.delete(lessonId);
+  for (const [problemId, scheduled] of scheduledProblems) {
+    if (scheduled.lessonId !== lessonId || scheduled.report) continue;
+    clearTimeout(scheduled.timer);
+    scheduledProblems.delete(problemId);
+    seenAvailableProblems.delete(problemId);
   }
 }
 
@@ -1887,55 +2110,128 @@ async function onAvailableProblem(problem: ProblemContext): Promise<void> {
   const remaining = problem.deadlineAt
     ? problem.deadlineAt - Date.now()
     : Infinity;
-  if (remaining <= delay) return;
+  if (problem.source !== 'classroom-report' && remaining <= delay) {
+    await logAutomation(
+      problem,
+      'skipped',
+      'insufficient-time-before-deadline',
+      delay,
+    );
+    return;
+  }
+  await logAutomation(problem, 'scheduled', '', delay);
   await emitLocalNotice(
     'auto-answer-scheduled',
     problem,
     'LLM 答案生成已排队',
     `${Math.ceil(delay / 1000)} 秒后开始分析。`,
   );
-  const startAnalysis = async (): Promise<void> => {
-    const current = problems.value.find((item) => item.id === problem.id);
+  const timer = setTimeout(() => {
+    scheduledProblems.delete(problem.id);
+    void answerScheduledProblem(problem, environment);
+  }, delay);
+  scheduledProblems.set(problem.id, {
+    timer,
+    lessonId: problem.lessonId,
+    report: problem.source === 'classroom-report',
+  });
+}
+
+async function answerScheduledProblem(
+  problem: ProblemContext,
+  environment: BrowserEnvironment,
+): Promise<void> {
+  try {
+    if (props.environment !== environment) return;
+    if (!settings.value?.llmAutoGenerate) {
+      await logAutomation(problem, 'skipped', 'auto-generation-disabled');
+      return;
+    }
+    const latest = await window.yuketang.listProblems(problem.lessonId);
+    const current = latest.find((item) => item.id === problem.id);
     if (
       props.environment !== environment ||
-      selectedLessonId.value !== problem.lessonId ||
       !settings.value?.llmAutoGenerate ||
-      current?.status !== 'available' ||
-      (current.deadlineAt && current.deadlineAt <= Date.now())
+      !current ||
+      !canAutomaticallyAnswer(current) ||
+      (current.source !== 'classroom-report' &&
+        current.deadlineAt &&
+        current.deadlineAt <= Date.now())
     ) {
-      scheduledProblems.delete(problem.id);
+      // Cancellation before generation is not a completed attempt. Returning
+      // to a review (or re-enabling automation) can schedule it again.
+      seenAvailableProblems.delete(problem.id);
+      await logAutomation(
+        current ?? problem,
+        'skipped',
+        !settings.value?.llmAutoGenerate
+          ? 'auto-generation-disabled'
+          : !current
+            ? 'problem-not-found'
+            : current.status !== 'available'
+              ? `problem-${current.status}`
+              : 'deadline-passed',
+      );
       return;
     }
     if (
       busy.value ||
       (aiRequestPending.value && !currentAiSession.value?.lastAuto)
     ) {
-      scheduledProblems.set(
-        problem.id,
-        setTimeout(() => void startAnalysis(), 500),
-      );
+      const timer = setTimeout(() => {
+        scheduledProblems.delete(problem.id);
+        void answerScheduledProblem(problem, environment);
+      }, 500);
+      scheduledProblems.set(problem.id, {
+        timer,
+        lessonId: problem.lessonId,
+        report: problem.source === 'classroom-report',
+      });
       return;
     }
-    scheduledProblems.delete(problem.id);
-    selectedProblemId.value = current.id;
-    aiSlideSelection.value = [];
-    try {
-      await nextTick();
-      // Bind each request to its queued problem, even when another timer or
-      // user selection changes the active problem before this tick completes.
-      await requestAiProposal(
-        current,
-        current.id,
-        '分析这道题并给出答案建议。',
-        true,
-        false,
-      );
-    } catch (error) {
-      errorMessage.value = errorText(error);
+    const lessonPresentations = await window.yuketang.listPresentations(
+      current.lessonId,
+    );
+    const imageUrl = lessonPresentations
+      .find((presentation) => presentation.id === current.presentationId)
+      ?.slides.find((slide) => slide.id === current.slideId)?.imageUrl;
+    if (props.environment !== environment) return;
+    if (!settings.value?.llmAutoGenerate) {
+      await logAutomation(current, 'skipped', 'auto-generation-disabled');
+      return;
     }
-  };
-  const timer = setTimeout(() => void startAnalysis(), delay);
-  scheduledProblems.set(problem.id, timer);
+    if (
+      current.source !== 'classroom-report' &&
+      current.deadlineAt &&
+      current.deadlineAt <= Date.now()
+    ) {
+      await logAutomation(current, 'skipped', 'deadline-passed');
+      return;
+    }
+    if (
+      !agentAutoSubmitEnabled.value &&
+      selectedLessonId.value === current.lessonId
+    ) {
+      selectedProblemId.value = current.id;
+      aiSlideSelection.value = [];
+      await nextTick();
+    }
+    await requestAiProposal(
+      current,
+      current.id,
+      '分析这道题并给出答案建议。',
+      true,
+      false,
+      imageUrl ? [imageUrl] : [],
+    );
+  } catch (error) {
+    await emitLocalNotice(
+      'auto-answer-failed',
+      problem,
+      'Agent 未完成自动作答',
+      errorText(error),
+    );
+  }
 }
 
 async function refreshLogs(): Promise<void> {
@@ -2287,9 +2583,21 @@ function clamp(value: number, min: number, max: number): number {
                 </span>
                 <span>ID {{ selectedProblem.id }}</span>
               </div>
+              <img
+                v-if="
+                  selectedProblem.source === 'classroom-report' &&
+                  selectedProblemImage
+                "
+                :src="selectedProblemImage"
+                alt="课堂回顾习题原图"
+                class="review-problem-image"
+              />
               <p>
                 {{
-                  selectedProblem.prompt || '该题没有文本题干，请查看中央网页。'
+                  selectedProblem.prompt ||
+                  (selectedProblem.source === 'classroom-report'
+                    ? '题干和选项见上方原图，AI 将使用这张习题图片作答。'
+                    : '该题没有文本题干，请查看中央网页。')
                 }}
               </p>
             </div>
@@ -3700,6 +4008,12 @@ function clamp(value: number, min: number, max: number): number {
 </template>
 
 <style scoped>
+.review-problem-image {
+  display: block;
+  width: 100%;
+  height: auto;
+  margin-top: 12px;
+}
 .assistant-panel {
   position: relative;
   z-index: 4;
