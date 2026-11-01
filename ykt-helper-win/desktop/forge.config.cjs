@@ -28,7 +28,10 @@ module.exports = {
     },
     executableName: 'YuketangHelper',
     icon: path.join(__dirname, 'build', 'icon'),
-    extraResource: [path.join(__dirname, 'cli', 'ykt-cli.cjs')],
+    extraResource: [
+      path.join(__dirname, 'cli', 'ykt-cli.cjs'),
+      path.join(__dirname, 'build', 'icon.ico'),
+    ],
     ignore: [
       /^\/\.electron-cache($|\/)/,
       /^\/build($|\/)/,

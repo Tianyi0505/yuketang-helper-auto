@@ -14,6 +14,7 @@ import {
   Notification,
   powerSaveBlocker,
   shell,
+  Tray,
   type WebContents,
 } from 'electron';
 import { createBackendRuntime, type BackendRuntime } from '@ykt/backend';
@@ -75,6 +76,9 @@ let quitAfterCleanup = false;
 let keepScreenAwake = false;
 let wakeLockId: number | null = null;
 const activeNotifications = new Set<Notification>();
+let tray: Tray | undefined;
+/** 真正的退出流程已开始（托盘菜单退出 / 系统关机 / 更新重启），此时关闭窗口不再隐藏。 */
+let isQuitting = false;
 
 function recordNotificationLog(entry: Omit<NewAppLogEntry, 'scope'>): void {
   // Never let diagnostic storage interrupt a classroom event or OS request.
@@ -92,16 +96,14 @@ configureStorageProfile();
 const hasSingleInstanceLock =
   !electronSquirrelStartup && app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) {
+  console.warn(
+    '[ykt-helper] 已有一个桌面实例在运行，本次启动将直接退出并激活现有窗口。' +
+      '如需重新启动，请先关闭已运行的雨课堂助手进程。',
+  );
   app.quit();
 } else {
   app.on('second-instance', () => {
-    if (!mainWindow || mainWindow.isDestroyed()) {
-      if (app.isReady()) void createWindow().catch(reportStartupError);
-      return;
-    }
-    if (mainWindow.isMinimized()) mainWindow.restore();
-    mainWindow.show();
-    mainWindow.focus();
+    void showMainWindow().catch(reportStartupError);
   });
 }
 
@@ -968,6 +970,64 @@ function safeFileName(value: string): string {
   return value.replace(/[\\/:*?"<>|]/g, '-').trim() || '雨课堂课件';
 }
 
+async function showMainWindow(): Promise<void> {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    if (app.isReady()) await createWindow();
+    return;
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+/** 开发态图标在 apps/desktop/build，打包态由 electron-forge 的 extraResource 放到 resources。 */
+function resolveTrayIconPath(): string | undefined {
+  return [
+    join(process.resourcesPath, 'icon.ico'),
+    join(__dirname, '../../build/icon.ico'),
+  ].find((candidate) => existsSync(candidate));
+}
+
+/**
+ * 常驻托盘：关闭窗口只隐藏，进程、内嵌网页与自动化任务继续运行。
+ * 托盘图标不可用时自动退回“关闭即退出”，避免出现无法关闭的窗口。
+ */
+function createTray(): void {
+  if (tray) return;
+  const iconPath = resolveTrayIconPath();
+  if (!iconPath) {
+    console.warn('[ykt-helper] 未找到托盘图标，关闭窗口将直接退出应用。');
+    return;
+  }
+  try {
+    const nextTray = new Tray(iconPath);
+    nextTray.setToolTip('雨课堂助手');
+    nextTray.setContextMenu(
+      Menu.buildFromTemplate([
+        {
+          label: '显示主窗口',
+          click: () => void showMainWindow().catch(reportStartupError),
+        },
+        { type: 'separator' },
+        { label: '退出雨课堂助手', click: () => quitFromTray() },
+      ]),
+    );
+    nextTray.on('click', () => void showMainWindow().catch(reportStartupError));
+    tray = nextTray;
+    console.log('[ykt-helper] 托盘已就绪，关闭窗口将隐藏到托盘继续运行。');
+  } catch (error: unknown) {
+    console.warn(
+      '[ykt-helper] 托盘创建失败，关闭窗口将直接退出应用：',
+      error instanceof Error ? error.message : error,
+    );
+  }
+}
+
+function quitFromTray(): void {
+  isQuitting = true;
+  app.quit();
+}
+
 async function createWindow(): Promise<void> {
   if (serviceCleanupPromise) {
     await serviceCleanupPromise;
@@ -987,6 +1047,9 @@ async function createWindow(): Promise<void> {
       sandbox: true,
       // Notification audio belongs to the trusted shell, not the embedded site.
       autoplayPolicy: 'no-user-gesture-required',
+      // 常驻托盘后窗口可能长期处于隐藏状态，禁止后台节流，
+      // 否则渲染进程里的定时轮询/答题流程会被浏览器降频甚至暂停。
+      backgroundThrottling: false,
     },
   });
   mainWindow = window;
@@ -1037,7 +1100,14 @@ async function createWindow(): Promise<void> {
   webProbeController = nextWebProbeController;
   const windowResources: { cliServer?: DesktopCliServer } = {};
   let disposed = false;
-  window.on('close', () => {
+  window.on('close', (event) => {
+    if (!isQuitting && tray) {
+      // 常驻：关闭窗口只收起，不销毁内嵌网页与运行时，自动化继续在后台运行。
+      event.preventDefault();
+      window.hide();
+      console.log('[ykt-helper] 窗口已隐藏到托盘，进程与自动化继续在后台运行。');
+      return;
+    }
     if (disposed) return;
     disposed = true;
     nextWebProbeController.cancel();
@@ -1164,7 +1234,16 @@ async function createWindow(): Promise<void> {
     }),
   );
   cliServer = windowResources.cliServer;
-  await windowResources.cliServer.start();
+  try {
+    await windowResources.cliServer.start();
+  } catch (error: unknown) {
+    // 命名管道可能被其他实例（或未释放的旧句柄）占用。桌面端主体不依赖 CLI，
+    // 因此降级为警告而不是让整个应用启动失败退出。
+    console.warn(
+      '[ykt-helper] CLI 命令行通道启动失败（命名管道被占用），桌面端继续运行：',
+      error instanceof Error ? error.message : error,
+    );
+  }
   if (window.isDestroyed()) return;
   let initialEnvironment = isBrowserEnvironment(settings.browserEnvironment)
     ? settings.browserEnvironment
@@ -1201,6 +1280,7 @@ if (hasSingleInstanceLock) {
     .then(async () => {
       Menu.setApplicationMenu(null);
       registerIpc();
+      createTray();
       await createWindow();
 
       app.on('activate', () => {
@@ -1222,14 +1302,28 @@ function reportStartupError(error: unknown): void {
   );
 }
 
+/** 关闭窗口后清理服务的最长等待时间；超时即放弃，避免进程卡在退出流程里。 */
+const serviceCleanupTimeoutMs = 5000;
+
 function cleanupServices(): Promise<void> {
   if (serviceCleanupPromise) return serviceCleanupPromise;
   const activeCliServer = cliServer;
   const activeRuntime = runtime;
-  serviceCleanupPromise = Promise.allSettled([
-    activeCliServer?.close() ?? Promise.resolve(),
-    activeRuntime?.stop() ?? Promise.resolve(),
-  ]).then(() => undefined);
+  serviceCleanupPromise = new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      // 清理挂住时必须放行退出：否则进程会以“无窗口但存活”的僵尸形态
+      // 继续占用单实例锁与命名管道，后续每次启动都会静默退出。
+      console.warn('[ykt-helper] 服务清理超时，继续退出流程。');
+      resolve();
+    }, serviceCleanupTimeoutMs);
+    void Promise.allSettled([
+      activeCliServer?.close() ?? Promise.resolve(),
+      activeRuntime?.stop() ?? Promise.resolve(),
+    ]).then(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
   return serviceCleanupPromise;
 }
 
@@ -1238,6 +1332,7 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', (event) => {
+  isQuitting = true;
   if (quitAfterCleanup) return;
   event.preventDefault();
   void cleanupServices().finally(() => {
