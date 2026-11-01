@@ -1,0 +1,8 @@
+{
+  "private": true,
+  "scripts": {
+    "verify": "node scripts/verify.mjs",
+    "verify:full": "node scripts/verify.mjs --full",
+    "test:verify": "node --test scripts/verify.test.mjs"
+  }
+}
